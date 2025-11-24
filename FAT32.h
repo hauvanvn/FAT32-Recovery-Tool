@@ -61,6 +61,10 @@ private:
     // format short 8.3 name
     static string formatShortName(const uint8_t name[11]);
 
+    // Boot sector parser and validator
+    bool parseAndValidateBootSector(const uint8_t *buffer);
+
+
 public:
     FAT32Recovery(const string &path); // Construct
     ~FAT32Recovery();                  // Deconstruct
@@ -82,6 +86,9 @@ public:
     // Utils
     uint64_t cluster2Offset(uint32_t cluster) const;
     void readCluster(uint32_t cluster, vector<uint8_t> &buffer) const;
+
+    // Boot sector backup fixer
+    bool fixBootSectorBackup();s
 };
 
 #endif //__FAT32__
