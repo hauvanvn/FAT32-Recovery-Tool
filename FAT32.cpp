@@ -46,7 +46,8 @@ FAT32Recovery::FAT32Recovery(const string &path) : imagePath(path)
     dataBegin = 0;
     totalClusters = 0;
 
-    fd = open(imagePath.c_str(), O_RDONLY);
+    //fd = open(imagePath.c_str(), O_RDONLY);
+    fd = open(imagePath.c_str(), O_RDWR);
     if (fd < 0)
     {
         throw runtime_error(string("Open failed:") + strerror(errno));
@@ -119,45 +120,148 @@ ssize_t FAT32Recovery::writeAll(int fd_out, const void *buf, size_t size) const
 }
 
 // ================================ BOOT SECTOR PARSER ==================================
+bool FAT32Recovery::parseAndValidateBootSector(const uint8_t *bs)
+{
+    // Check signature
+    uint16_t signature = read_u16_le(bs + 510);
+    if (signature != 0xAA55)
+        return false;
+
+    // Read fields
+    uint16_t temp_bytesPerSector = read_u16_le(bs + 11);
+    uint8_t temp_sectorPerCluster = bs[13];
+    uint16_t temp_reservedSectors = read_u16_le(bs + 14);
+    uint8_t temp_numFATs = bs[16];
+    uint32_t temp_sectorPerFat = read_u32_le(bs + 36);
+    uint32_t temp_rootCluster = read_u32_le(bs + 44);
+
+    // Basic validation
+    // Bytes per sector should be 512, 1024, 2048, or 4096, ...
+    if (temp_bytesPerSector == 0 || (temp_bytesPerSector % 512) != 0) return false;
+    // Sector per cluster should be power of 2 and <= 128
+    if (temp_sectorPerCluster == 0 || temp_sectorPerCluster > 128 || (temp_sectorPerCluster & (temp_sectorPerCluster - 1)) != 0) return false;
+    // Reserved sectors should be at least 1
+    if (temp_reservedSectors < 1) return false;
+    // Number of FATs should be 1 or 2
+    if (temp_numFATs < 1 || temp_numFATs > 2) return false;
+    // Sector per FAT should be non-zero
+    if (temp_sectorPerFat == 0) return false;
+    // Root cluster should be at least 2
+    if (temp_rootCluster < 2) return false;
+
+    // If all validations pass, assign to member variables
+    bytesPerSecor = temp_bytesPerSector;
+    sectorPerCluster = temp_sectorPerCluster;
+    reservedSectors = temp_reservedSectors;
+    numFATs = temp_numFATs;
+    sectorPerFat = temp_sectorPerFat;
+    rootCluster = temp_rootCluster;
+
+    return true;
+}
+
 void FAT32Recovery::readBootSector()
 {
     uint8_t bs[512];
-    ssize_t r = readBytes(0, bs, sizeof(bs));
-    if (r != (ssize_t)sizeof(bs))
+    bool valid = false;
+
+    // Try reading Sector 0 (Primary Boot Sector)===
+    cout << "[INFO] Checking Main Boot Sector (Sector 0)..." << endl;
+    if (readBytes(0, bs, sizeof(bs)) == (ssize_t)sizeof(bs))
     {
-        throw runtime_error("Failed toread boot sector");
+        if (parseAndValidateBootSector(bs))
+        {
+            cout << "OK :)" << endl;
+            valid = true;
+        }
+        else
+        {
+            cout << "Invalid :(" << endl;
+        }
+    }
+    
+    // If Primary Boot Sector is invalid, try reading Sector 6 (Backup Boot Sector)===
+    if (!valid)
+    {
+        cout << "[WARNING] Main Boot Sector corrupted. Attempting Backup Boot Sector (Sector 6)..." << endl;
+        // Sector 6 offset = 6 * 512 (assuming 512 bytes per sector, or read from existing bytesPerSector if available)
+        if (readBytes(6 * 512, bs, sizeof(bs)) == (ssize_t)sizeof(bs))
+        {
+            if (parseAndValidateBootSector(bs))
+            {
+                cout << "OK :). Recovered parameters from Backup." << endl;
+                valid = true;
+                // fixBootSectorBackup(); // Optionally fix the primary boot sector later
+            }
+            else
+            {
+                cout << "Invalid :(" << endl;
+            }
+        }
     }
 
-    bytesPerSecor = read_u16_le(bs + 11);
-    sectorPerCluster = bs[13];
-    reservedSectors = read_u16_le(bs + 14);
-    numFATs = bs[16];
-    sectorPerCluster = read_u32_le(bs + 36);
-    rootCluster = read_u32_le(bs + 44);
+    if (!valid)
+    {
+        throw runtime_error("CRITICAL: Both Main and Backup Boot Sectors are corrupted. Cannot mount volume.");
+    }
 
-    // compute offsets
+    // Compute offsets
     fatBegin = uint32_t(uint64_t(reservedSectors) * bytesPerSecor);
-    dataBegin = fatBegin + uint64_t(numFATs) * sectorPerFat * bytesPerSecor;
+    dataBegin = fatBegin + uint64_t(numFATs) * uint64_t(sectorPerFat) * bytesPerSecor;
 
     // compute total clusters base on image file size
     struct stat st;
     if (fstat(fd, &st) == 0)
     {
         uint64_t totalSectors = st.st_size / bytesPerSecor;
-        uint64_t dataSectors = totalSectors - (reservedSectors + uint64_t(numFATs) * sectorPerFat);
-        totalClusters = uint32_t(dataSectors / sectorPerCluster);
-    }
-    else
-    {
-        totalClusters = 0;
+        // Data sectors = Total - Reserved - (NumFATs * SectorsPerFAT)
+        uint64_t nonDataSectors = uint64_t(reservedSectors) + uint64_t(numFATs) * uint64_t(sectorPerFat);
+        
+        if (totalSectors > nonDataSectors)
+        {
+            uint64_t dataSectors = totalSectors - nonDataSectors;
+            totalClusters = uint32_t(dataSectors / sectorPerCluster);
+        }
+        else
+        {
+            totalClusters = 0;
+        }
     }
 
     // Sanity checks
-    if (bytesPerSecor == 0 || sectorPerCluster == 0 || sectorPerFat == 0)
+    // if (bytesPerSecor == 0 || sectorPerCluster == 0 || sectorPerFat == 0)
+    // {
+    //     throw runtime_error("Wrong Boot sector contains invalid values");
+    //     // Fix this later - HAU
+    // }
+}
+
+bool FAT32Recovery::fixBootSectorBackup()
+{
+    uint8_t backupBS[512];
+    // Read Backup Boot Sector (Sector 6)
+    if (readBytes(6 * 512, backupBS, sizeof(backupBS)) != (ssize_t)sizeof(backupBS))
     {
-        throw runtime_error("Wrong Boot sector contains invalid values");
-        // Fix this later - HAU
+        cout << "[ERROR] Failed to read Backup Boot Sector for fixing." << endl;
+        return false;
     }
+
+    // Validate Backup Boot Sector
+    if (!parseAndValidateBootSector(backupBS))
+    {
+        cout << "[ERROR] Backup Boot Sector is also invalid. Cannot fix." << endl;
+        return false;
+    }
+
+    // Write Backup Boot Sector to Primary Boot Sector (Sector 0)
+    cout << "[INFO] Overwriting Sector 0 with valid Backup from Sector 6..." << endl;
+    if (pwrite(fd, backupBS, sizeof(backupBS), 0) != (ssize_t)sizeof(backupBS))
+    {
+        cout << "[ERROR] Failed to write fixed Boot Sector." << endl;
+        return false;
+    }
+    cout << "[INFO] Successfully fixed Boot Sector." << endl;
+    return true;
 }
 
 // ================================ FAT TABLE LOADING ===================================
