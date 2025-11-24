@@ -9,6 +9,10 @@
 
 using namespace std;
 
+// Ultils
+static inline uint16_t read_u16_le(const uint8_t *p) { return uint16_t(p[0]) | (uint16_t(p[1]) << 8); }
+static inline uint16_t read_u32_le(const uint8_t *p) { return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24); }
+
 // Directory struct
 struct DirEntry
 {
@@ -39,7 +43,7 @@ private:
     uint16_t sectorPerCluster;
     uint16_t reservedSectors;
     uint8_t numFATs;
-    uint32_t secotrPerFat;
+    uint32_t sectorPerFat;
     uint32_t rootCluster;
 
     // Computed offsets
