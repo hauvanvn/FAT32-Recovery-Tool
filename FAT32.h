@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <set>
 
 using namespace std;
 
@@ -64,7 +65,6 @@ private:
     // Boot sector parser and validator
     bool parseAndValidateBootSector(const uint8_t *buffer);
 
-
 public:
     FAT32Recovery(const string &path); // Construct
     ~FAT32Recovery();                  // Deconstruct
@@ -72,6 +72,12 @@ public:
     // Load fields
     void readBootSector(); // Boot sector paeser
     void loadFAT();        // Load FAT table
+
+    // Validate & fix Disk
+    bool validateAndFixMBR(uint32_t partitionID, bool doFix);
+    void buildUsedClustersFromDirectories(set<uint32_t> &used); // Build set of clusters referenced by directories (and files)
+    void fixFATConsistency(bool doWriteBack);                   // Fix FAT table consistency between FAT and directory references
+    void writeFAT2Disk();
 
     // Scanning & recovery routines
     void scanRoot();
@@ -88,7 +94,7 @@ public:
     void readCluster(uint32_t cluster, vector<uint8_t> &buffer) const;
 
     // Boot sector backup fixer
-    bool fixBootSectorBackup();s
+    bool fixBootSectorBackup();
 };
 
 #endif //__FAT32__
