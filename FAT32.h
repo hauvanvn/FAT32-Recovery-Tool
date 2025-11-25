@@ -81,6 +81,7 @@ struct DirEntry
     bool isLFN() const;
     bool isdDir() const;
     uint32_t getStartCluster() const;
+    string getNameString() const;
 };
 
 class FAT32Recovery
@@ -134,12 +135,14 @@ public:
     // FAT fields
     void loadFAT(); // Load FAT table
     void writeFAT();
+    void scanAndAutoRepair(uint32_t dirCluster, bool fix);
+    int repairFolderAndClusters(uint32_t dirCluster);
+    vector<uint32_t> contiguousGuess(uint32_t startCluster, uint32_t fileSize) const;
 
     // Scanning & recovery routines
-    void scanRoot();
-    void scanDirectory(uint32_t startCluster);
+    // void scanRoot();
+    // void scanDirectory(uint32_t startCluster);
     vector<uint32_t> followFAT(uint32_t startCluster) const;
-    vector<uint32_t> contiguousGuess(uint32_t startCluster, uint32_t fileSize) const;
 
     // Recover file with given start cluster and file size (output -> outPath)
     // Will write exactly fileSize bytes (so it truncates last cluster properly)
