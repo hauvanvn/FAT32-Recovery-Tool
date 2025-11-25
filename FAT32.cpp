@@ -1,7 +1,7 @@
 #include "FAT32.h"
 
 #include <fcntl.h>
-#include <unistd.h>
+
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -41,30 +41,32 @@ uint32_t DirEntry::getStartCluster() const
 // ======================================================================
 FAT32Recovery::FAT32Recovery(const string &path) : imagePath(path)
 {
-    fd = -1;
-    bytesPerSecor = 0;
-    sectorPerCluster = 0;
-    reservedSectors = 0;
-    numFATs = 0;
-    sectorPerFat = 0;
-    rootCluster = 0;
+    // fd = -1;
+    bootSector.bytesPerSector = 0;
+    bootSector.sectorsPerCluster = 0;
+    bootSector.reservedSectors = 0;
+    bootSector.numFATs = 0;
+    bootSector.sectorsPerFat = 0;
+    bootSector.rootCluster = 0;
+
     fatBegin = 0;
     dataBegin = 0;
     totalClusters = 0;
 
-    // fd = open(imagePath.c_str(), O_RDONLY);
-    fd = open(imagePath.c_str(), O_RDWR);
-    if (fd < 0)
+    vhd.open(path, ios::in | ios::out | ios::binary);
+
+    if (!vhd.is_open())
         throw runtime_error(string("Open failed: ") + strerror(errno));
 
-    readBootSector();
-    loadFAT();
+    // readBootSector();
+    // loadFAT();
+    // readMBR();
 }
 
 FAT32Recovery::~FAT32Recovery()
 {
-    if (fd >= 0)
-        close(fd);
+    if (vhd.is_open())
+        vhd.close();
 }
 
 // ======================================================================
@@ -99,503 +101,754 @@ string FAT32Recovery::formatShortName(const uint8_t name[11])
 
 ssize_t FAT32Recovery::readBytes(uint64_t offset, void *buf, size_t size) const
 {
-    ssize_t r = pread(fd, buf, size, offset);
-    return (r < 0 ? -1 : r);
+    // fstream::seekg yêu cầu quyền thay đổi trạng thái stream,
+    // nên ta cần 'mutable' hoặc cast 'const' đi nếu vhd là const member.
+    // Cách tốt nhất là dùng một biến fstream không const.
+
+    auto &mutable_vhd = const_cast<fstream &>(vhd);
+
+    mutable_vhd.clear(); // Xóa cờ lỗi (EOF, Fail) trước khi seek
+    mutable_vhd.seekg(offset, ios::beg);
+
+    if (mutable_vhd.fail())
+        return -1;
+
+    mutable_vhd.read((char *)buf, size);
+    return mutable_vhd.gcount(); // Trả về số byte thực tế đã đọc
 }
 
-ssize_t FAT32Recovery::writeAll(int fd_out, const void *buf, size_t size) const
+void FAT32Recovery::writeAll(ostream &out, const void *buf, size_t size) const
 {
-    size_t written = 0;
-    const uint8_t *p = (const uint8_t *)buf;
+    // Ép kiểu về const char* vì fstream yêu cầu char*
+    out.write(static_cast<const char *>(buf), size);
 
-    while (written < size)
+    // Kiểm tra trạng thái stream sau khi ghi
+    if (out.fail() || out.bad())
     {
-        ssize_t w = write(fd_out, p + written, size - written);
-        if (w <= 0)
-        {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        written += w;
+        // Có thể throw exception hoặc xử lý tùy logic của bạn
+        throw runtime_error("Failed to write data to output file.");
     }
-    return written;
+}
+// ======================================================================
+//                       MBR PARSING / VALIDATION
+// ======================================================================
+void FAT32Recovery::readMBR()
+{
+    cout << "[SCAN] Reading MBR(Master Boot Record)\n";
+    ssize_t bytesRead = readBytes(0, &mbr, sizeof(MBR));
+    if (bytesRead != sizeof(MBR))
+    {
+        throw runtime_error("Failed to read full MBR (512 bytes)");
+    }
+
+    // Check signature
+    if (mbr.signature != 0xAA55)
+        cout << "[MBR] No signature found\n";
+
+    cout << "[SUCCESS] MBR loaded\n";
+    cout << "[INFO] Starting validate and fix partition...\n";
+    for (int i = 0; i < 4; ++i)
+    {
+        cout << "       Checking partition " << i << "...\n";
+        validateAndFixPartition(i);
+    }
+
+    cout << "================================\n";
 }
 
-// ======================================================================
-//                       BOOT SECTOR PARSING / VALIDATION
-// ======================================================================
-bool FAT32Recovery::parseAndValidateBootSector(const uint8_t *bs)
+bool FAT32Recovery::validateAndFixPartition(int index)
 {
-    // Check signature
-    uint16_t signature = read_u16_le(bs + 510);
+    // Kiểm tra biên
+    if (index < 0 || index >= 4)
+        throw runtime_error("Invalid partition index");
+
+    ParEntry &p = mbr.partitions[index];
+    bool isMBRDirty = false; // Cờ đánh dấu xem MBR có bị thay đổi cần ghi lại không
+
+    // 1. Check signature của MBR
+    if (mbr.signature != 0xAA55)
+    {
+        cout << "[WARN] Invalid MBR signature (found " << hex << mbr.signature << "), fixing to 0xAA55...\n";
+        mbr.signature = 0xAA55;
+        isMBRDirty = true;
+    }
+
+    // 2. Must have non-zero LBA (Partition rỗng hoặc chưa khởi tạo)
+    if (p.lbaFirst == 0)
+    {
+        cout << "[ERROR] Partition LBA=0 -> cannot fix (likely empty entry)\n";
+        return false;
+    }
+
+    // 3. Read boot sector
+    // Boot Sector nằm tại sector đầu tiên của Partition (LBA First)
+    uint8_t sector[512];
+    ssize_t n = readBytes((uint64_t)p.lbaFirst * 512ULL, sector, 512);
+    if (n != 512)
+    {
+        cout << "[ERROR] Cannot read boot sector at LBA " << p.lbaFirst << "\n";
+        return false;
+    }
+
+    // 4. Validate Boot Sector Signature (0xAA55 tại offset 510)
+    // uint16_t bsSignature = read_u16_le(sector + 510);
+    // if (bsSignature != 0xAA55)
+    // {
+    //     cout << "[ERR] Invalid Boot Sector Signature at LBA " << p.lbaFirst
+    //               << ". Found: 0x" << hex << bsSignature << " (Expected: 0xAA55)\n";
+    //     return false;
+    // }
+
+    // Cast buffer -> struct BootSector
+    BootSector *bpb = reinterpret_cast<BootSector *>(sector);
+
+    // 5. Validate BPB logic
+    if (bpb->bytesPerSector != 512 ||
+        bpb->sectorsPerCluster == 0 ||
+        bpb->totalSectors32 == 0)
+    {
+        cout << "[ERROR] Invalid FAT32 Boot Sector values -> partition description is wrong\n";
+        return false;
+    }
+
+    uint32_t correctSize = bpb->totalSectors32;
+
+    // 6. Fix partition type
+    // FAT32 LBA thường là 0x0C. Nếu nó đang sai (ví dụ 0x00 hoặc loại khác), ta sửa lại.
+    if (p.partitionType != 0x0B && p.partitionType != 0x0C)
+    {
+        cout << "[FIX] Wrong partition type 0x" << std::hex << (int)p.partitionType
+             << " -> setting to FAT32 LBA (0x0C)\n";
+        p.partitionType = 0x0C;
+        isMBRDirty = true;
+    }
+
+    // 7. Fix size mismatch
+    // Nếu kích thước trong Partition Table khác với kích thước khai báo trong Boot Sector
+    if (p.numSectors != correctSize)
+    {
+        std::cout << "[FIX] Wrong partition size: "
+                  << std::dec << p.numSectors << " -> " << correctSize << "\n";
+        p.numSectors = correctSize;
+        isMBRDirty = true;
+    }
+
+    // 8. Ghi đè MBR xuống đĩa nếu có sửa đổi (Write Back)
+    if (isMBRDirty)
+    {
+        // Xóa các cờ lỗi (nếu có) của fstream
+        vhd.clear();
+        // Di chuyển con trỏ ghi về đầu file (MBR nằm ở LBA 0, offset 0)
+        vhd.seekp(0, std::ios::beg);
+        if (!vhd.fail())
+        {
+            vhd.write(reinterpret_cast<const char *>(&mbr), sizeof(MBR));
+            vhd.flush();
+            std::cout << "[INFO] MBR has been updated and saved to disk.\n";
+        }
+        else
+        {
+            std::cout << "[ERROR] Failed to seek to MBR position for writing.\n";
+            return false;
+        }
+    }
+
+    // (Optional) Fix CHS
+    // memset(p.chsFirst, 0, 3);
+    // memset(p.chsLast, 0, 3);
+
+    return true;
+}
+
+// // ======================================================================
+// //                       BOOT SECTOR PARSING / VALIDATION
+// // ======================================================================
+void FAT32Recovery::listPartition()
+{
+    cout << "=== Partition Table ===\n";
+    for (int i = 0; i < 4; i++)
+    {
+        ParEntry &p = mbr.partitions[i];
+        // Bỏ qua partition rỗng
+        if (p.numSectors == 0 || p.lbaFirst == 0)
+            continue;
+
+        cout << "Partition [" << i << "]: "
+             << "Type=0x" << hex << (int)p.partitionType << dec
+             << ", Start LBA=" << p.lbaFirst
+             << ", Size=" << p.numSectors << " sectors";
+
+        if (p.partitionType == 0x0B || p.partitionType == 0x0C)
+            cout << " (FAT32 Detected)";
+        else if (p.partitionType == 0x07)
+            cout << " (NTFS/exFAT)";
+        else
+            cout << " (Unknown)";
+
+        cout << "\n";
+    }
+    cout << "================================\n";
+}
+
+bool FAT32Recovery::parseAndValidateBootSector(const uint8_t *buffer)
+{
+    // 1. Check signature ở cuối sector (Offset 510)
+    uint16_t signature = read_u16_le(buffer + 510);
     if (signature != 0xAA55)
         return false;
 
-    // Read fields
-    uint16_t temp_bytesPerSector = read_u16_le(bs + 11);
-    uint8_t temp_sectorPerCluster = bs[13];
-    uint16_t temp_reservedSectors = read_u16_le(bs + 14);
-    uint8_t temp_numFATs = bs[16];
-    uint32_t temp_sectorPerFat = read_u32_le(bs + 36);
-    uint32_t temp_rootCluster = read_u32_le(bs + 44);
+    const BootSector *tempBS = reinterpret_cast<const BootSector *>(buffer);
 
-    // Basic validation
-    // Bytes per sector should be 512, 1024, 2048, or 4096, ...
-    if (temp_bytesPerSector == 0 || (temp_bytesPerSector % 512) != 0)
-        return false;
-    // Sector per cluster should be power of 2 and <= 128
-    if (temp_sectorPerCluster == 0 || temp_sectorPerCluster > 128 || (temp_sectorPerCluster & (temp_sectorPerCluster - 1)) != 0)
-        return false;
-    // Reserved sectors should be at least 1
-    if (temp_reservedSectors < 1)
-        return false;
-    // Number of FATs should be 1 or 2
-    if (temp_numFATs < 1 || temp_numFATs > 2)
-        return false;
-    // Sector per FAT should be non-zero
-    if (temp_sectorPerFat == 0)
-        return false;
-    // Root cluster should be at least 2
-    if (temp_rootCluster < 2)
+    // 2. Validate Bytes Per Sector
+    // FAT32 chuẩn thường là 512, 1024, 2048, 4096.
+    if (tempBS->bytesPerSector == 0 ||
+        (tempBS->bytesPerSector != 512 && tempBS->bytesPerSector != 1024 && tempBS->bytesPerSector != 2048 && tempBS->bytesPerSector != 4096))
         return false;
 
-    // If all validations pass, assign to member variables
-    bytesPerSecor = temp_bytesPerSector;
-    sectorPerCluster = temp_sectorPerCluster;
-    reservedSectors = temp_reservedSectors;
-    numFATs = temp_numFATs;
-    sectorPerFat = temp_sectorPerFat;
-    rootCluster = temp_rootCluster;
+    // 3. Validate Sectors Per Cluster
+    // Phải là lũy thừa của 2 và <= 128
+    if (tempBS->sectorsPerCluster == 0 ||
+        tempBS->sectorsPerCluster > 128 ||
+        (tempBS->sectorsPerCluster & (tempBS->sectorsPerCluster - 1)) != 0)
+        return false;
+
+    // 4. Validate Reserved Sectors (Phải > 0, thường là 32 với FAT32)
+    if (tempBS->reservedSectors < 1)
+        return false;
+
+    // 5. Validate Number of FATs (Thường là 2, đôi khi là 1)
+    if (tempBS->numFATs < 1 || tempBS->numFATs > 2)
+        return false;
+
+    // 6. Validate Sectors Per FAT (FAT32 dùng field 32-bit tại offset 0x24)
+    if (tempBS->sectorsPerFat == 0)
+        return false;
+
+    // 7. Validate Root Cluster (Thường là 2)
+    if (tempBS->rootCluster < 2)
+        return false;
+
+    // 8. Validate Total Sectors (Phải khác 0)
+    if (tempBS->totalSectors32 == 0)
+        return false;
+
+    // === Hợp lệ: Copy dữ liệu vào biến thành viên của class ===
+    // Copy phần struct (64 bytes)
+    memcpy(&this->bootSector, buffer, sizeof(BootSector));
 
     return true;
 }
 
-void FAT32Recovery::readBootSector()
+void FAT32Recovery::readBootSector(int partitionId)
 {
-    uint8_t bs[512];
+    cout << "[SCAN] Reading Boot Secotr at partition " << partitionId << "...\n";
+    // 1. Check validation of Index
+    if (partitionId < 0 || partitionId >= 4)
+        throw runtime_error("Invalid partition index. Must be 0-3.");
+
+    ParEntry &p = mbr.partitions[partitionId];
+
+    // 2. Check if partition exist
+    if (p.lbaFirst == 0 || p.numSectors == 0)
+    {
+        throw runtime_error("Partition is empty or invalid.");
+    }
+
+    // 3. Check Partition type (FAT32)
+    if (p.partitionType != 0x0B && p.partitionType != 0x0C)
+    {
+        cout << "[WARN] Partition type is not standard FAT32 (0x0B/0x0C). Reading anyway...\n";
+    }
+
+    // 4. Calculate start Offset (locate Boot Sector)
+    uint64_t partitionStartOffset = (uint64_t)p.lbaFirst * 512ULL;
+    cout << "[SCAN] Reading Boot Sector for Partition " << partitionId
+         << " at Offset " << partitionStartOffset << "\n";
+
+    // 5. Read và Validate
+    uint8_t bsBuffer[512];
     bool valid = false;
 
-    // Try reading Sector 0 (Primary Boot Sector)===
-    cout << "[INFO] Checking Main Boot Sector (Sector 0)..." << endl;
-    if (readBytes(0, bs, sizeof(bs)) == (ssize_t)sizeof(bs))
+    // --- Try Main Boot Sector ---
+    if (readBytes(partitionStartOffset, bsBuffer, 512) == 512)
     {
-        if (parseAndValidateBootSector(bs))
+        if (parseAndValidateBootSector(bsBuffer))
         {
-            cout << "OK :)" << endl;
+            cout << "[INFO] Main Boot Sector OK.\n";
             valid = true;
         }
-        else
-        {
-            cout << "Invalid :(" << endl;
-        }
     }
 
-    // If Primary Boot Sector is invalid, try reading Sector 6 (Backup Boot Sector)===
+    // --- Try Backup Boot Sector ---
+    // Backup thường nằm ở Sector 6 so với đầu Partition
     if (!valid)
     {
-        cout << "[WARNING] Main Boot Sector corrupted. Attempting Backup Boot Sector (Sector 6)..." << endl;
-        // Sector 6 offset = 6 * 512 (assuming 512 bytes per sector, or read from existing bytesPerSector if available)
-        if (readBytes(6 * 512, bs, sizeof(bs)) == (ssize_t)sizeof(bs))
+        cout << "[WARN] Main BS failed. Trying Backup at Sector 6...\n";
+        uint64_t backupOffset = partitionStartOffset + (6ULL * 512ULL);
+
+        if (readBytes(backupOffset, bsBuffer, 512) == 512)
         {
-            if (parseAndValidateBootSector(bs))
+            if (parseAndValidateBootSector(bsBuffer))
             {
-                cout << "OK :). Recovered parameters from Backup." << endl;
+                cout << "[INFO] Backup Boot Sector OK.\n";
                 valid = true;
-                // fixBootSectorBackup(); // Optionally fix the primary boot sector later
-            }
-            else
-            {
-                cout << "Invalid :(" << endl;
+
+                if (!fixBootSectorBackup(partitionStartOffset))
+                {
+                    cout << "[WARN] Failed to automatically fix Main Boot Sector.\n";
+                }
             }
         }
     }
 
     if (!valid)
-    {
-        throw runtime_error("CRITICAL: Both Main and Backup Boot Sectors are corrupted. Cannot mount volume.");
-    }
+        throw runtime_error("Cannot load Boot Sector for the selected partition.");
 
-    // Compute offsets
-    fatBegin = uint32_t(uint64_t(reservedSectors) * bytesPerSecor);
-    dataBegin = fatBegin + uint64_t(numFATs) * uint64_t(sectorPerFat) * bytesPerSecor;
+    // 6. Calculate FAT/Data (Base on Partition Offset)
+    fatBegin = partitionStartOffset + (uint64_t)bootSector.reservedSectors * bootSector.bytesPerSector;
 
-    // compute total clusters base on image file size
-    struct stat st;
-    if (fstat(fd, &st) == 0)
-    {
-        uint64_t totalSectors = st.st_size / bytesPerSecor;
-        // Data sectors = Total - Reserved - (NumFATs * SectorsPerFAT)
-        uint64_t nonDataSectors = uint64_t(reservedSectors) + uint64_t(numFATs) * uint64_t(sectorPerFat);
+    uint64_t fatSizeInBytes = (uint64_t)bootSector.sectorsPerFat * bootSector.bytesPerSector;
+    dataBegin = fatBegin + ((uint64_t)bootSector.numFATs * fatSizeInBytes);
 
-        if (totalSectors > nonDataSectors)
-        {
-            uint64_t dataSectors = totalSectors - nonDataSectors;
-            totalClusters = uint32_t(dataSectors / sectorPerCluster);
-        }
-        else
-        {
-            totalClusters = 0;
-        }
-    }
+    // Tính Total Clusters
+    uint64_t dataSectors = bootSector.totalSectors32 - bootSector.reservedSectors - (bootSector.numFATs * bootSector.sectorsPerFat);
+    totalClusters = dataSectors / bootSector.sectorsPerCluster;
 
-    // Sanity checks
-    // if (bytesPerSecor == 0 || sectorPerCluster == 0 || sectorPerFat == 0)
-    // {
-    //     throw runtime_error("Wrong Boot sector contains invalid values");
-    //     // Fix this later - HAU
-    // }
+    cout << "[SUCCESS] Initialized Volume from Partition " << partitionId << "\n";
+    cout << "================================\n";
 }
 
-bool FAT32Recovery::fixBootSectorBackup()
+bool FAT32Recovery::fixBootSectorBackup(uint64_t partitionStartOffset)
 {
     uint8_t backupBS[512];
-    // Read Backup Boot Sector (Sector 6)
-    if (readBytes(6 * 512, backupBS, sizeof(backupBS)) != (ssize_t)sizeof(backupBS))
+    for (int i = 0; i < 4; i++)
     {
-        cout << "[ERROR] Failed to read Backup Boot Sector for fixing." << endl;
+        if (mbr.partitions[i].partitionType == 0x0B || mbr.partitions[i].partitionType == 0x0C)
+        {
+            partitionStartOffset = (uint64_t)mbr.partitions[i].lbaFirst * 512ULL;
+            break;
+        }
+    }
+
+    uint64_t backupOffset = partitionStartOffset + (6ULL * 512ULL); // Sector 6
+    uint64_t mainOffset = partitionStartOffset;                     // Sector 0
+
+    // 1. Đọc Backup Boot Sector
+    if (readBytes(backupOffset, backupBS, 512) != 512)
+    {
+        cout << "[ERROR] Failed to read Backup Boot Sector for fixing.\n";
         return false;
     }
 
-    // Validate Backup Boot Sector
+    // 2. Validate lại cho chắc
+    // Lưu ý: parseAndValidateBootSector sẽ thay đổi this->bootSector,
+    // nhưng ở đây ta chỉ muốn check bool return thôi.
+    // Để an toàn, ta copy BootSector hiện tại ra biến tạm hoặc chấp nhận nó cập nhật lại.
+    BootSector savedState = this->bootSector;
     if (!parseAndValidateBootSector(backupBS))
     {
-        cout << "[ERROR] Backup Boot Sector is also invalid. Cannot fix." << endl;
+        cout << "[ERROR] Backup Boot Sector is also invalid. Cannot fix.\n";
+        this->bootSector = savedState; // Restore state
         return false;
     }
 
-    // Write Backup Boot Sector to Primary Boot Sector (Sector 0)
-    cout << "[INFO] Overwriting Sector 0 with valid Backup from Sector 6..." << endl;
-    if (pwrite(fd, backupBS, sizeof(backupBS), 0) != (ssize_t)sizeof(backupBS))
+    // 3. Ghi đè lên Main Boot Sector (Sector 0)
+    cout << "[INFO] Overwriting Main Boot Sector with Backup...\n";
+
+    vhd.clear();
+    vhd.seekp(mainOffset, std::ios::beg);
+    if (vhd.fail())
     {
-        cout << "[ERROR] Failed to write fixed Boot Sector." << endl;
+        cout << "[ERROR] Seek failed.\n";
         return false;
     }
-    cout << "[INFO] Successfully fixed Boot Sector." << endl;
+
+    vhd.write(reinterpret_cast<const char *>(backupBS), 512);
+    if (vhd.fail())
+    {
+        cout << "[ERROR] Write failed.\n";
+        return false;
+    }
+
+    vhd.flush();
+    cout << "[INFO] Successfully fixed Boot Sector.\n";
     return true;
 }
 
-// ======================================================================
-//                        FAT TABLE LOAD / WRITE
-// ======================================================================
 void FAT32Recovery::loadFAT()
 {
-    uint64_t fatBytes = uint64_t(sectorPerFat) * bytesPerSecor;
-
-    vector<uint8_t> buf(fatBytes);
-    if (readBytes(fatBegin, buf.data(), buf.size()) != (ssize_t)buf.size())
-        throw runtime_error("Failed to read FAT");
-
-    size_t entries = buf.size() / 4;
-    FAT.assign(entries, 0);
-
-    for (size_t i = 0; i < entries; ++i)
-        FAT[i] = read_u32_le(&buf[i * 4]) & 0x0FFFFFFF;
-}
-
-void FAT32Recovery::writeFAT2Disk()
-{
-    if (FAT.empty())
-        throw runtime_error("No FAT loaded");
-
-    vector<uint8_t> buf(FAT.size() * 4);
-
-    for (size_t i = 0; i < FAT.size(); ++i)
+    // Đảm bảo các thông số đã được khởi tạo từ readBootSector/selectPartition
+    if (bootSector.sectorsPerFat == 0 || bootSector.bytesPerSector == 0 || fatBegin == 0)
     {
-        uint32_t v = FAT[i] & 0x0FFFFFFF;
-        buf[i * 4 + 0] = (v & 0xFF);
-        buf[i * 4 + 1] = (v >> 8);
-        buf[i * 4 + 2] = (v >> 16);
-        buf[i * 4 + 3] = (v >> 24);
+        throw runtime_error("FAT parameters not initialized. Call readBootSector/selectPartition first.");
     }
 
-    for (uint8_t i = 0; i < numFATs; ++i)
+    // 1. Tính toán kích thước của một bản sao FAT (bằng byte)
+    uint64_t fatSizeBytes = (uint64_t)bootSector.sectorsPerFat * bootSector.bytesPerSector;
+
+    if (fatSizeBytes == 0)
     {
-        uint64_t off = fatBegin + uint64_t(i) * sectorPerFat * bytesPerSecor;
-        if (pwrite(fd, buf.data(), buf.size(), off) != (ssize_t)buf.size())
-            throw runtime_error("Failed to write FAT");
+        throw runtime_error("Calculated FAT size is zero.");
     }
 
-    fsync(fd);
-    cout << "[INFO] FAT updated.\n";
-}
+    cout << "[INFO] FAT table size: " << fatSizeBytes << " bytes. Reading from offset: "
+         << fatBegin << endl;
 
-// ======================================================================
-//                         CLUSTER UTILITIES
-// ======================================================================
-uint64_t FAT32Recovery::cluster2Offset(uint32_t cluster) const
-{
-    if (cluster < 2)
-        throw runtime_error("Invalid cluster number");
+    // 2. Chuẩn bị buffer và đọc toàn bộ FAT table từ đĩa
+    std::vector<uint8_t> fatBuffer(fatSizeBytes);
 
-    return dataBegin + uint64_t(cluster - 2) * sectorPerCluster * bytesPerSecor;
-}
+    ssize_t n = readBytes(fatBegin, fatBuffer.data(), fatSizeBytes);
 
-void FAT32Recovery::readCluster(uint32_t cluster, vector<uint8_t> &buffer) const
-{
-    uint64_t off = cluster2Offset(cluster);
-    size_t size = sectorPerCluster * bytesPerSecor;
+    if (n != (ssize_t)fatSizeBytes)
+    {
+        // Xử lý lỗi đọc
+        throw runtime_error("Failed to read entire FAT table from disk. Read " +
+                            std::to_string(n) + " of " + std::to_string(fatSizeBytes) + " bytes.");
+    }
 
-    buffer.resize(size);
-    ssize_t r = readBytes(off, buffer.data(), size);
+    // 3. Xử lý các FAT entry
+    // Mỗi entry FAT32 là 4 bytes.
+    uint32_t numEntries = fatSizeBytes / sizeof(uint32_t);
+    FAT.reserve(numEntries); // Đặt trước kích thước để tối ưu hiệu suất
 
-    if (r != (ssize_t)size)
-        throw runtime_error("Failed to read cluster");
+    for (uint32_t i = 0; i < numEntries; ++i)
+    {
+        // Con trỏ tới vị trí 4-byte của entry hiện tại
+        const uint8_t *entryPtr = fatBuffer.data() + i * sizeof(uint32_t);
+
+        // Đọc giá trị 32-bit (4 bytes) theo kiểu Little Endian
+        uint32_t entry = read_u32_le(entryPtr);
+
+        // *Chú ý quan trọng:* FAT32 chỉ sử dụng 28 bit thấp (0x0FFFFFFF).
+        // 4 bit cao nhất (MSBs) phải được che đi (masked out) vì chúng thường được dùng làm bit lỗi hoặc reserved.
+        FAT.push_back(entry & 0x0FFFFFFF);
+    }
+
+    cout << "[INFO] Loaded FAT table successfully. Total entries (clusters): " << std::dec << FAT.size() << endl;
+    cout << "       FAT[0] (Media Type): 0x" << std::hex << FAT[0] << endl;
+    cout << "       FAT[1] (EOC Marker): 0x" << std::hex << FAT[1] << std::dec << endl;
+
+    // Dọn dẹp: Đảm bảo luồng cout không bị ảnh hưởng bởi hex/dec
+    cout << dec;
+    cout << "================================\n";
 }
 
 // ======================================================================
-//                         VALIDATE & FIX FUNCTIONS
+//                       FILE SYSTEM (FAT32)
 // ======================================================================
-bool FAT32Recovery::validateAndFixMBR(uint32_t partitionID, bool doFix)
+
+// ======================================================================
+//                       DELETED FILE RECOVERY
+// ======================================================================
+string FAT32Recovery::restoreDeletedName(const uint8_t name[11])
 {
-    // READ MBR
-    const uint16_t mbrBytes = 512;
-    vector<uint8_t> mbr(mbrBytes);
-    if (readBytes(0, mbr.data(), mbr.size()) != (ssize_t)mbr.size())
+    uint8_t tempName[11];
+    memcpy(tempName, name, 11);
+    if (tempName[0] == 0xE5)
+        tempName[0] = '_';
+    return formatShortName(tempName);
+}
+
+void FAT32Recovery::rawRecoverFile(uint32_t startCluster, uint32_t fileSize, const string &destPath)
+{
+    cout << "   -> Recovering: Start Cluster " << startCluster << ", Size " << fileSize << " bytes...\n";
+
+    // 1. Mở file đầu ra bằng ofstream (C++)
+    ofstream outFile(destPath, ios::binary | ios::trunc);
+    if (!outFile.is_open())
     {
-        cout << "Failed to read MBR\n";
-        return false;
+        cout << "      [ERROR] Cannot create output file: " << destPath << "\n";
+        return;
     }
 
-    // check MBR signature 0x55AA
-    if (mbr[510] != 0x55 || mbr[511] != 0xAA)
-    {
-        cout << "MBR signature missing\n";
-    }
+    uint32_t currentCluster = startCluster;
+    uint32_t bytesRemaining = fileSize;
+    uint32_t bytesPerClus = bootSector.sectorsPerCluster * bootSector.bytesPerSector;
+    vector<uint8_t> buffer;
 
-    if (partitionID >= 4)
-        return false;
-    size_t partEntryOff = 0x1BE + partitionID * 16;
-    uint8_t *pe = mbr.data() + partEntryOff;
-
-    // Partition starting LBA
-    uint32_t partStartLBA = uint32_t(pe[8]) | (uint32_t(pe[9]) << 8) | (uint32_t(pe[10]) << 16) | (uint32_t(pe[11]) << 24);
-    uint32_t parType = pe[4];
-
-    // Find where our boot sector actually sits:
-    // We consider boot sector at offset 0 in current implementation (image may be partition image).
-    // But if image is full-disk, real boot is at partStartLBA * bytesPerSector.
-    // Let's detect: check for 0x55AA at offset partStartLBA*bytesPerSector, and also check our bootsector signature at offset 11..12 (bytes per sector value).
-    // Read boot candidate at LBA = partStartLBA
-    std::vector<uint8_t> bs(bytesPerSecor); // bytesPerSecor available only if we've already parsed boot sector; but this function may be called early.
-    // So we'll read 512 bytes and inspect 0x55AA
-    std::vector<uint8_t> candidate(512);
-    uint64_t candidateOff = uint64_t(partStartLBA) * 512ULL;
-    if (pread(fd, candidate.data(), candidate.size(), candidateOff) != (ssize_t)candidate.size())
+    while (bytesRemaining > 0)
     {
-        // cannot read candidate (maybe startLBA outside file): treat as invalid
-        cerr << "validateAndFixMBR: cannot read candidate boot at partition LBA " << partStartLBA << "\n";
-    }
-    else
-    {
-        bool sig = (candidate[510] == 0x55 && candidate[511] == 0xAA);
-        if (!sig)
+        // Kiểm tra an toàn: Tràn dải cluster
+        if (currentCluster >= totalClusters + 2)
         {
-            cerr << "validateAndFixMBR: partition entry points to LBA " << partStartLBA << " but no boot signature there.\n";
+            cout << "      [WARN] Reached end of valid clusters.\n";
+            break;
+        }
+
+        // --- Logic: Consecutive Empty Cluster ---
+        // Nếu là cluster đầu tiên HOẶC cluster hiện tại trong FAT = 0 (trống)
+        bool isStart = (currentCluster == startCluster);
+        bool isFree = (currentCluster < FAT.size() && FAT[currentCluster] == 0);
+
+        if (isStart || isFree)
+        {
+            try
+            {
+                // Đọc data từ Disk Image
+                readCluster(currentCluster, buffer);
+
+                // Tính toán lượng byte cần ghi
+                size_t chunkSize = (bytesRemaining < bytesPerClus) ? bytesRemaining : bytesPerClus;
+
+                // Ghi ra file kết quả
+                outFile.write((char *)buffer.data(), chunkSize);
+
+                bytesRemaining -= chunkSize;
+            }
+            catch (exception &e)
+            {
+                cout << "      [ERROR] Reading cluster " << currentCluster << ": " << e.what() << "\n";
+                break;
+            }
         }
         else
         {
-            // Good: partition entry matches a boot sector.
-            cout << "validateAndFixMBR: partition " << partitionID << " points to a valid boot sector.\n";
+            // Nếu cluster này đã bị chiếm dụng (Allocated) bởi file khác -> Bỏ qua (Skip)
+            // cout << "      [Debug] Skipping allocated cluster " << currentCluste\nr;
         }
+
+        // Tăng tuyến tính để tìm mảnh tiếp theo
+        currentCluster++;
     }
 
-    // Heuristic: if the boot sector used by our parser (the one read at offset 0) looks like FAT32 (we have bytesPerSecor etc),
-    // but partition table points elsewhere, propose to update partition entry to 0.
-    // Check current boot sector at LBA 0 too:
-    bool bootAtZeroIsFAT = false;
+    outFile.close();
+    cout << "      [INFO] Saved to " << destPath << "\n";
+}
+
+void FAT32Recovery::recoverDeletedFilesInDir(uint32_t dirCluster, const string &outputFolder)
+{
+    // Tạo folder (Lệnh này phụ thuộc OS, trên Windows dùng mkdir)
+    string cmd = "mkdir \"" + outputFolder + "\"";
+    system(cmd.c_str());
+
+    cout << "[INFO] Scanning deleted files in Cluster " << dirCluster << "\n";
+
+    vector<uint32_t> dirChain = followFAT(dirCluster);
+    if (dirChain.empty())
+        dirChain.push_back(dirCluster);
+
+    vector<uint8_t> buf;
+    for (uint32_t c : dirChain)
     {
-        std::vector<uint8_t> b0(512);
-        if (pread(fd, b0.data(), b0.size(), 0) == (ssize_t)b0.size())
+        readCluster(c, buf);
+        for (size_t off = 0; off + 32 <= buf.size(); off += 32)
         {
-            // check 0x55AA and BPB signature plausibility (bytes per sector non-zero)
-            if (b0[510] == 0x55 && b0[511] == 0xAA)
+            DirEntry de;
+            memcpy(&de, buf.data() + off, 32);
+
+            if (de.name[0] == 0x00)
+                break; // Hết thư mục
+
+            // Logic nhận diện file xóa: Bắt đầu 0xE5 và không phải LFN
+            if (de.name[0] == 0xE5 && !de.isLFN())
             {
-                uint16_t bps = uint16_t(b0[11]) | (uint16_t(b0[12]) << 8);
-                uint8_t spc = b0[13];
-                if (bps == bytesPerSecor && spc == sectorPerCluster)
+                string recName = restoreDeletedName(de.name);
+                uint32_t startClus = de.getStartCluster();
+                uint32_t fSize = de.fileSize;
+
+                // Basic validation để lọc rác
+                if (startClus >= 2 && fSize > 0 && fSize < 200 * 1024 * 1024)
                 {
-                    bootAtZeroIsFAT = true;
-                }
-                else if (bps == 512)
-                {
-                    // not strictly equal but plausible
-                    bootAtZeroIsFAT = true;
+                    cout << "Found: " << recName << " (Start: " << startClus << ", Size: " << fSize << ")\n";
+                    string outPath = outputFolder + "/" + recName;
+                    rawRecoverFile(startClus, fSize, outPath);
                 }
             }
         }
     }
-
-    if (bootAtZeroIsFAT && partStartLBA != 0)
-    {
-        cerr << "validateAndFixMBR: detected mismatch: image contains a FAT boot at LBA 0, but MBR partition points to LBA " << partStartLBA << "\n";
-        if (doFix)
-        {
-            // Patch partition start LBA to 0 and write MBR back
-            uint32_t newStart = 0;
-            pe[8] = (newStart & 0xFF);
-            pe[9] = ((newStart >> 8) & 0xFF);
-            pe[10] = ((newStart >> 16) & 0xFF);
-            pe[11] = ((newStart >> 24) & 0xFF);
-            // write MBR back
-            if (pwrite(fd, mbr.data(), mbr.size(), 0) != (ssize_t)mbr.size())
-            {
-                cerr << "validateAndFixMBR: failed to write MBR patch: " << strerror(errno) << "\n";
-                return false;
-            }
-            cout << "validateAndFixMBR: patched partition " << partitionID << " start LBA -> 0\n";
-        }
-        else
-        {
-            cout << "validateAndFixMBR: call with doFix=true to auto-patch MBR partition start to 0\n";
-        }
-    }
-
-    return true;
 }
 
-// ======================================================================
-//                      FAT CONSISTENCY CHECK & REPAIR
-// ======================================================================
-void FAT32Recovery::buildUsedClustersFromDirectories(set<uint32_t> &used)
+void FAT32Recovery::recoverAllRecursively(uint32_t cluster, const string &hostPath)
 {
-    // traverse directory tree starting from rootCluster
-    // naive stack-based traversal without LFN reconstruction
-    vector<uint32_t> stack;
-    stack.push_back(rootCluster);
+    // 1. Tạo thư mục trên máy tính (Host OS) để giữ đúng cấu trúc cây
+    // (Lưu ý: trên Windows dùng lệnh mkdir string, Linux dùng mkdir -p)
+    string cmd = "mkdir -p \"" + hostPath + "\""; // Linux/MacOS
+    // string cmd = "mkdir \"" + hostPath + "\""; // Windows (bạn tự điều chỉnh tùy OS)
+    system(cmd.c_str());
 
-    while (!stack.empty())
+    cout << "[SCAN] Entering Directory Cluster: " << cluster << " -> " << hostPath << "\n";
+
+    // 2. Lấy nội dung thư mục (Directory Content)
+    vector<uint32_t> dirChain = followFAT(cluster);
+    if (dirChain.empty())
+        dirChain.push_back(cluster); // Fallback nếu FAT lỗi
+
+    vector<uint8_t> buf;
+    for (uint32_t c : dirChain)
     {
-        uint32_t cl = stack.back();
-        stack.pop_back();
-        // read directory clusters chain (use followFAT)
-        vector<uint32_t> dirChain = followFAT(cl);
-        if (dirChain.empty())
-            dirChain.push_back(cl);
-
-        vector<uint8_t> buf;
-        for (uint32_t c : dirChain)
+        // Đọc dữ liệu của cluster hiện tại trong chuỗi thư mục
+        try
         {
             readCluster(c, buf);
-            // read 32-byte entries
-            for (size_t off = 0; off + 32 <= buf.size(); off += 32)
+        }
+        catch (...)
+        {
+            continue;
+        } // Bỏ qua nếu lỗi đọc đĩa
+
+        // Duyệt từng entry 32-byte
+        for (size_t off = 0; off + 32 <= buf.size(); off += 32)
+        {
+            DirEntry de;
+            memcpy(&de, buf.data() + off, 32);
+
+            if (de.name[0] == 0x00)
+                break; // Hết danh sách -> Dừng xử lý cluster này
+            if (de.isLFN())
+                continue; // Bỏ qua Long File Name entry
+
+            // Lấy tên (Short Name)
+            string name = formatShortName(de.name);
+
+            // ==========================================
+            // CASE 1: FILE ĐÃ XÓA (Byte đầu là 0xE5)
+            // ==========================================
+            if (de.isDeleted())
             {
-                DirEntry de;
-                memcpy(&de, buf.data() + off, 32);
-                if (de.name[0] == 0x00)
-                    break; // end
-                if (de.isLFN())
-                    continue;
-                if (de.isDeleted())
-                    continue;
-                uint32_t start = de.getStartCluster();
-                if (start >= 2 && start < 2 + totalClusters)
+                // Chỉ phục hồi nếu nó KHÔNG phải là thư mục (Directory) đã xóa
+                // (Khôi phục thư mục đã xóa rất khó vì mất link, ở đây ta chỉ cứu FILE)
+                if (!de.isdDir())
                 {
-                    // follow file cluster chain (best-effort using FAT)
-                    vector<uint32_t> fileChain = followFAT(start);
-                    if (fileChain.empty())
+                    string recName = restoreDeletedName(de.name);
+                    uint32_t startClus = de.getStartCluster();
+                    uint32_t size = de.fileSize;
+
+                    // Validate cơ bản
+                    if (startClus >= 2 && size > 0 && size < 500 * 1024 * 1024)
                     {
-                        // even if no FAT, assume at least start cluster belongs
-                        used.insert(start);
-                    }
-                    else
-                    {
-                        for (uint32_t fc : fileChain)
-                            used.insert(fc);
+                        string fullOutputPath = hostPath + "/" + recName;
+                        // Gọi hàm rawRecoverFile bạn đã viết trước đó
+                        rawRecoverFile(startClus, size, fullOutputPath);
                     }
                 }
-                // if dir, push to stack
-                if (de.isdDir())
+            }
+            // ==========================================
+            // CASE 2: THƯ MỤC ĐANG TỒN TẠI (Đệ quy)
+            // ==========================================
+            else if (de.isdDir())
+            {
+                // RẤT QUAN TRỌNG: Bỏ qua "." và ".." để tránh lặp vô tận
+                if (name == "." || name == "..")
+                    continue;
+
+                uint32_t subDirCluster = de.getStartCluster();
+
+                // Validate cluster hợp lệ
+                if (subDirCluster >= 2)
                 {
-                    string s = formatShortName(de.name);
-                    if (s != "." && s != ".." && de.getStartCluster() >= 2)
-                    {
-                        stack.push_back(de.getStartCluster());
-                    }
+                    string newHostPath = hostPath + "/" + name;
+
+                    // GỌI ĐỆ QUY: Đi sâu vào thư mục con
+                    recoverAllRecursively(subDirCluster, newHostPath);
                 }
             }
         }
     }
 }
-
-void FAT32Recovery::fixFATConsistency(bool doWriteBack)
+// ======================================================================
+//                       Scanning & recovery routines
+// ======================================================================
+vector<uint32_t> FAT32Recovery::followFAT(uint32_t startCluster) const
 {
-    // Build used set from directory references
-    set<uint32_t> used;
-    buildUsedClustersFromDirectories(used);
+    vector<uint32_t> chain;
 
-    // Build set of clusters marked used in FAT
-    set<uint32_t> fatUsed;
-    for (uint32_t i = 2; i < FAT.size(); ++i)
+    // Sử dụng Set để phát hiện vòng lặp vô tận (Infinite Loop)
+    // Trường hợp FAT bị lỗi: 5 -> 6 -> 7 -> 5 ...
+    set<uint32_t> visited;
+
+    uint32_t current = startCluster;
+
+    // FAT32 Mask: Chỉ dùng 28 bit thấp, 4 bit cao là reserved.
+    const uint32_t FAT32_MASK = 0x0FFFFFFF;
+    const uint32_t EOC_MARK = 0x0FFFFFF8; // Giá trị >= mức này là kết thúc
+    const uint32_t BAD_CLUS = 0x0FFFFFF7; // Cluster hỏng
+
+    while (true)
     {
-        uint32_t v = FAT[i];
-        if (v != 0)
-            fatUsed.insert(i);
-    }
-
-    // Orphan clusters: in FAT used but not referenced -> mark free
-    vector<uint32_t> orphan;
-    for (uint32_t c : fatUsed)
-    {
-        if (!(used.count(c)))
-            orphan.push_back(c);
-    }
-
-    // Missing clusters: referenced by directory but FAT shows 0 -> we'll try to allocate chains by marking EOC for single cluster,
-    // or if consecutive clusters are free, attempt to create contiguous chain using contiguousGuess heuristic.
-    vector<uint32_t> missing;
-    for (uint32_t c : used)
-    {
-        if (c < FAT.size() && FAT[c] == 0)
-            missing.push_back(c);
-    }
-
-    cout << "fixFATConsistency: used clusters from directories = " << used.size()
-         << ", clusters marked used in FAT = " << fatUsed.size()
-         << ", orphan clusters = " << orphan.size()
-         << ", missing clusters = " << missing.size() << "\n";
-
-    // Handle orphans: mark cluster and its chain free (set to 0)
-    for (uint32_t c : orphan)
-    {
-        // follow chain starting from c and clear entries
-        uint32_t cur = c;
-        while (cur < FAT.size() && FAT[cur] != 0)
+        // 1. Kiểm tra biên (Boundary Check)
+        // Cluster hợp lệ phải >= 2 và nằm trong kích thước bảng FAT
+        if (current < 2 || current >= FAT.size())
         {
-            uint32_t nxt = FAT[cur];
-            FAT[cur] = 0;
-            if (nxt >= 0x0FFFFFF8)
-                break;
-            if (nxt == 0)
-                break;
-            if (nxt == cur)
-                break;
-            cur = nxt;
+            // Nếu trỏ ra ngoài phạm vi -> Chuỗi bị đứt hoặc lỗi
+            break;
         }
-    }
 
-    // Handle missing: for each missing start cluster, if possible mark it as EOC (single cluster) so file will be readable for that one cluster.
-    // If you want, you can attempt contiguous allocation: here we only mark single-cluster EOC to be safe.
-    for (uint32_t c : missing)
-    {
-        if (c < FAT.size())
+        // 2. Kiểm tra vòng lặp (Loop Detection)
+        if (visited.count(current))
         {
-            FAT[c] = 0x0FFFFFFF; // mark EOC for single cluster
+            cout << "[Warning] FAT Cycle detected at cluster " << current << ". Stopping chain.\n";
+            break;
         }
+
+        // Ghi nhận cluster này
+        visited.insert(current);
+        chain.push_back(current);
+
+        // 3. Đọc giá trị tiếp theo từ bảng FAT
+        // Lưu ý: Phải dùng bitwise AND với 0x0FFFFFFF
+        uint32_t next = FAT[current] & FAT32_MASK;
+
+        // 4. Các điều kiện dừng (Termination Conditions)
+
+        // A. End of Chain (EOC): Kết thúc file
+        if (next >= EOC_MARK)
+        {
+            break;
+        }
+
+        // B. Bad Cluster: Cluster bị đánh dấu hỏng
+        if (next == BAD_CLUS)
+        {
+            cout << "[Warning] Encountered BAD CLUSTER marker.\n";
+            break;
+        }
+
+        // C. Free Cluster (0): Chuỗi bị đứt gãy
+        // (Bình thường file đang tồn tại không được trỏ về 0, nếu có là do lỗi cấu trúc)
+        if (next == 0)
+        {
+            // cout << "[Warning] Chain broken (points to FREE) at " << curren\nt;
+            break;
+        }
+
+        // 5. Nhảy tới cluster tiếp theo
+        current = next;
     }
 
-    // Optionally write FAT back
-    if (doWriteBack)
-    {
-        writeFAT2Disk();
-        cout << "fixFATConsistency: FAT written back to disk\n";
-    }
-    else
-    {
-        cout << "fixFATConsistency: FAT modified in memory but not written. Call with doWriteBack=true to persist.\n";
-    }
+    return chain;
 }
 
 // ======================================================================
-//                              END OF FILE
+//                       UTILS
 // ======================================================================
+void FAT32Recovery::readCluster(uint32_t cluster, vector<uint8_t> &buffer) const
+{
+    // 1. Kiểm tra tính hợp lệ
+    // Cluster trong FAT32 bắt đầu từ 2. Các giá trị 0 và 1 được dành riêng.
+    if (cluster < 2)
+    {
+        // Có thể throw lỗi hoặc return rỗng tùy chiến lược xử lý lỗi
+        throw runtime_error("Invalid cluster number: " + to_string(cluster));
+    }
+
+    // 2. Tính toán Offset (Vị trí byte trên đĩa)
+    // Công thức: Offset = Start_Data_Region + (Cluster_Index - 2) * Cluster_Size
+    uint32_t clusterSize = bootSector.sectorsPerCluster * bootSector.bytesPerSector;
+
+    // Cần ép kiểu uint64_t để tránh tràn số (overflow) với ổ đĩa lớn
+    uint64_t offset = dataBegin + (uint64_t)(cluster - 2) * clusterSize;
+
+    // 3. Chuẩn bị Buffer
+    // Resize buffer đúng bằng kích thước 1 cluster để chứa dữ liệu
+    buffer.resize(clusterSize);
+
+    // 4. Đọc dữ liệu
+    // Gọi hàm readBytes (đã viết lại dùng fstream)
+    ssize_t bytesRead = readBytes(offset, buffer.data(), clusterSize);
+
+    // 5. Kiểm tra lỗi đọc
+    if (bytesRead != (ssize_t)clusterSize)
+    {
+        throw runtime_error("Failed to read cluster " + to_string(cluster));
+    }
+}
