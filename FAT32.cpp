@@ -210,16 +210,68 @@ void FAT32Recovery::readMBR()
         throw runtime_error("Failed to read full MBR (512 bytes)");
     }
 
+    bool needRebuild = false;
+
     // Check signature
     if (mbr.signature != 0xAA55)
-        cout << "[MBR] No signature found\n";
-
-    cout << "[SUCCESS] MBR loaded\n";
-    cout << "[INFO] Starting validate and fix partition...\n";
-    for (int i = 0; i < 4; ++i)
     {
-        cout << "       Checking partition " << i << "...\n";
-        validateAndFixPartition(i);
+        cout << "[WARN] Invalid MBR signature (found 0x" << hex << mbr.signature << "), expected 0xAA55\n";
+        needRebuild = true;
+    }
+    else
+    {
+        int validPartitionsCount = 0;
+        int nonEmptyEntries = 0;
+
+        for (int i = 0; i < 4; ++i)
+        {
+            ParEntry &p = mbr.partitions[i];
+            if (p.lbaFirst == 0 && p.numSectors == 0)
+                continue; // Empty partition entry
+            nonEmptyEntries++;
+
+            uint8_t checkBuf[512];
+            uint64_t offset = (uint64_t)p.lbaFirst * 512ULL;
+
+            if (readBytes(offset, checkBuf, 512) == 512)
+            {
+                if (parseAndValidateBootSector(checkBuf))
+                {
+                    validPartitionsCount++;
+                }
+                else
+                {
+                    cout << "[WARN] Partition " << i << " has invalid Boot Sector data.\n";
+                }
+            }
+        }
+
+        if (nonEmptyEntries == 0)
+        {
+            cout << "[WARN] No valid partitions found in MBR.\n";
+            needRebuild = true;
+        }
+        else if (validPartitionsCount == 0)
+        {
+            cout << "[WARN] No valid FAT32 partitions found in MBR.\n";
+            needRebuild = true;
+        }
+    }
+
+    if (needRebuild)
+    {
+        cout << "[CRITICAL] MBR appears to be corrupted. Initiating rebuild process...\n";
+        scanAndRebuildMBR();
+    }
+    else
+    {
+        cout << "[SUCCESS] MBR loaded\n";
+        cout << "[INFO] Starting validate and fix partition...\n";
+        for (int i = 0; i < 4; ++i)
+        {
+            cout << "       Checking partition " << i << "...\n";
+            validateAndFixPartition(i);
+        }
     }
 
     cout << "================================\n";
@@ -356,6 +408,69 @@ void FAT32Recovery::listPartition()
     cout << "================================\n";
 }
 
+void FAT32Recovery::scanAndRebuildMBR()
+{
+    cout << "[CRITICAL RECOVERY] Scanning disk for FAT32 partitions to rebuild MBR...\n";
+
+    memset(mbr.partitions, 0, sizeof(mbr.partitions));
+    mbr.signature = 0xAA55;
+    int partFound = 0;
+
+    uint8_t buf[512];
+    uint64_t currentSector = 0;
+    uint64_t maxSectors = 10000000; // Giới hạn quét (tùy chỉnh theo kích thước đĩa)
+
+    while (currentSector < maxSectors && partFound < 4)
+    {
+        if (currentSector == 0)
+        {
+            currentSector = 63;
+            continue; // Bỏ qua MBR
+        }
+
+        uint64_t offset = currentSector * 512ULL;
+        if (readBytes(offset, buf, 512) != 512)
+            break;
+
+        if (parseAndValidateBootSector(buf))
+        {
+            uint32_t totalSectors = bootSector.totalSectors32;
+            cout << "   -> Found FAT32 Boot Sector at LBA " << currentSector
+                 << " (Size: " << totalSectors << " sectors)\n";
+            // Điền thông tin vào partition entry
+            ParEntry &p = mbr.partitions[partFound];
+            p.status = (partFound == 0) ? 0x80 : 0x00; // Active cho partition đầu tiên
+            p.partitionType = 0x0C; // FAT32 LBA
+            p.lbaFirst = (uint32_t)currentSector;
+            p.numSectors = totalSectors;
+
+            partFound++;
+            currentSector += p.numSectors; // Bỏ qua vùng partition này
+            continue;
+        }
+        if (currentSector < 65536)
+            currentSector++; // Quét chậm hơn ở vùng đầu
+        else
+            currentSector += 2048; // Quét nhanh hơn ở vùng sau
+    }
+
+    if (partFound > 0)
+    {
+        cout << "[SUCCESS] Found " << partFound << " FAT32 partition(s). Writing new MBR to disk...\n";
+        // Ghi MBR mới xuống đĩa
+        vhd.clear();
+        vhd.seekp(0, ios::beg);
+        vhd.write(reinterpret_cast<const char *>(&mbr), sizeof(MBR));
+        vhd.flush();
+        cout << "[INFO] New MBR has been written to disk.\n";
+    }
+    else
+    {
+        cout << "[FAILED] No FAT32 partitions found during scan. Cannot rebuild MBR.\n";
+    }
+
+}
+
 // // ======================================================================
 // //                       BOOT SECTOR PARSING / VALIDATION
 // // ======================================================================
@@ -461,18 +576,30 @@ void FAT32Recovery::readBootSector(int partitionId)
             {
                 cout << "[INFO] Backup Boot Sector OK.\n";
 
-                if (!fixBootSectorBackup(partitionStartOffset))
+                if (fixBootSectorBackup(partitionStartOffset))
                 {
-                    cout << "[WARN] Failed to automatically fix Main Boot Sector.\n";
+                    cout << "[SUCCESS] Boot Sector fixed from Backup.\n";
+                    valid = true;
                 }
                 else
-                    valid = true;
+                {
+                    cout << "[ERROR] Failed to fix Boot Sector from Backup.\n";
+                }
             }
-            else if (reconstructBootSector(partitionId))
-            {
-                cout << "[SUCCESS] Boot Sector reconstructed successfully.\n";
-                valid = true;
-            }
+        }
+        else
+        {
+            cout << "[ERROR] Cannot read Backup Boot Sector.\n";
+        }
+    }
+
+    if (!valid)
+    {
+        cout << "[WARN] Both Boot Sectors are invalid. Attempting to reconstruct...\n";
+        if (reconstructBootSector(partitionId))
+        {
+            cout << "[SUCCESS] Boot Sector reconstructed successfully.\n";
+            valid = true;
         }
     }
 

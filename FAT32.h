@@ -139,6 +139,7 @@ public:
     // Init logic
     void readMBR();
     bool validateAndFixPartition(int index);
+    void scanAndRebuildMBR();
     void listPartition();
     void readBootSector(int partitionID);
     bool fixBootSectorBackup(uint64_t partitionStartOffset);
