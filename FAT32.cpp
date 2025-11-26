@@ -966,6 +966,17 @@ void FAT32Recovery::scanAndAutoRepair(uint32_t dirCluster, bool fix)
     for (size_t i = 0; i < num; i++)
     {
         DirEntry *e = (DirEntry *)(buf.data() + i * 32);
+        
+        if (e->isdDir()) {
+            // Nếu là Folder, fileSize luôn = 0 nên ta không thể check theo cách thông thường.
+            // Chỉ cần đảm bảo chuỗi FAT không bị đứt (size > 0) là được.
+            auto chain = followFAT(e->getStartCluster());
+            if (chain.empty() && e->getStartCluster() != 0) {
+                cout << "[ERROR] Directory " << e->getNameString() << " has empty chain but Valid Start Cluster!\n";
+            }
+            // Folder hợp lệ thì bỏ qua check size
+            continue; 
+        }
 
         if (e->name[0] == 0x00 || e->isDeleted() || e->isLFN())
             continue;

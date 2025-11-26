@@ -14,8 +14,8 @@ using namespace std;
 
 // Utils
 static inline uint16_t read_u16_le(const uint8_t *p) { return uint16_t(p[0]) | (uint16_t(p[1]) << 8); }
-static inline uint16_t read_u32_le(const uint8_t *p) { return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24); }
-// typedef signed long long ssize_t;
+static inline uint32_t read_u32_le(const uint8_t *p) { return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24); }
+typedef signed long long ssize_t;
 
 // Struct lưu thông tin file bị xóa (Dùng cho phân tích)
 struct DeletedFileInfo
