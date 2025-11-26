@@ -96,12 +96,12 @@ string DirEntry::getNameString() const
     }
 }
 
-uint32_t DirEntry::getWriteTimestamp() const 
+uint32_t DirEntry::getWriteTimestamp() const
 {
     return (uint32_t(date) << 16) | uint32_t(time);
 }
 
-uint32_t DirEntry::getCreationTimestamp() const 
+uint32_t DirEntry::getCreationTimestamp() const
 {
     return (uint32_t(crtDate) << 16) | uint32_t(crtTime);
 }
@@ -245,7 +245,7 @@ bool FAT32Recovery::validateAndFixPartition(int index)
     // 2. Must have non-zero LBA (Partition rỗng hoặc chưa khởi tạo)
     if (p.lbaFirst == 0)
     {
-        cout << "[ERROR] Partition LBA=0 -> cannot fix (likely empty entry)\n";
+        cout << "[WARN] Partition empty\n";
         return false;
     }
 
@@ -329,9 +329,6 @@ bool FAT32Recovery::validateAndFixPartition(int index)
     return true;
 }
 
-// // ======================================================================
-// //                       BOOT SECTOR PARSING / VALIDATION
-// // ======================================================================
 void FAT32Recovery::listPartition()
 {
     cout << "=== Partition Table ===\n";
@@ -359,6 +356,9 @@ void FAT32Recovery::listPartition()
     cout << "================================\n";
 }
 
+// // ======================================================================
+// //                       BOOT SECTOR PARSING / VALIDATION
+// // ======================================================================
 bool FAT32Recovery::parseAndValidateBootSector(const uint8_t *buffer)
 {
     // 1. Check signature ở cuối sector (Offset 510)
@@ -460,12 +460,18 @@ void FAT32Recovery::readBootSector(int partitionId)
             if (parseAndValidateBootSector(bsBuffer))
             {
                 cout << "[INFO] Backup Boot Sector OK.\n";
-                valid = true;
 
                 if (!fixBootSectorBackup(partitionStartOffset))
                 {
                     cout << "[WARN] Failed to automatically fix Main Boot Sector.\n";
                 }
+                else
+                    valid = true;
+            }
+            else if (reconstructBootSector(partitionId))
+            {
+                cout << "[SUCCESS] Boot Sector reconstructed successfully.\n";
+                valid = true;
             }
         }
     }
@@ -544,11 +550,179 @@ bool FAT32Recovery::fixBootSectorBackup(uint64_t partitionStartOffset)
     return true;
 }
 
+bool FAT32Recovery::reconstructBootSector(int partitionID)
+{
+    cout << "\n[CRITICAL RECOVERY] Both Boot Sectors are dead. Attempting to reconstruct geometry...\n";
+
+    // 1. Xác định Offset bắt đầu của Partition
+    ParEntry &p = mbr.partitions[partitionID];
+    uint64_t partStartOffset = (uint64_t)p.lbaFirst * 512ULL;
+
+    // Biến để lưu kết quả tìm kiếm
+    uint64_t fat1StartOffset = 0;
+    uint64_t fat2StartOffset = 0;
+    bool foundFAT1 = false;
+
+    // 2. SCANNING: Quét 2048 sector đầu tiên của partition để tìm chữ ký bảng FAT
+    // Signature của FAT32 entry 0 thường là: F8 FF FF 0F (cho Hard Disk)
+    uint8_t buffer[512];
+
+    // Giới hạn quét: Thường Reserved sectors khoảng 32-100 sector. Quét 4000 cho chắc.
+    int scanLimit = 4000;
+
+    for (int i = 1; i < scanLimit; i++)
+    {
+        uint64_t currentOffset = partStartOffset + (uint64_t)i * 512ULL;
+
+        if (readBytes(currentOffset, buffer, 512) != 512)
+            break;
+
+        // Kiểm tra chữ ký đầu bảng FAT (Cluster 0 entry)
+        // 0xF8: Media descriptor for Hard Disk
+        // 0xFF 0xFF 0x0F: High bits
+        if (buffer[0] == 0xF8 && buffer[1] == 0xFF && buffer[2] == 0xFF && buffer[3] == 0x0F)
+        {
+            if (!foundFAT1)
+            {
+                cout << "   -> Found potential FAT #1 at relative sector: " << i << "\n";
+                fat1StartOffset = currentOffset;
+                foundFAT1 = true;
+
+                // Tạm thời giả định Reserved Sectors
+                this->bootSector.reservedSectors = (uint16_t)i;
+            }
+            else
+            {
+                // Nếu tìm thấy chữ ký lần nữa, đó có thể là FAT #2
+                cout << "   -> Found potential FAT #2 at relative sector: " << i << "\n";
+                fat2StartOffset = currentOffset;
+                break; // Tìm thấy cả 2 là đủ
+            }
+        }
+    }
+
+    if (fat1StartOffset == 0 || fat2StartOffset == 0)
+    {
+        cerr << "[FAILED] Could not locate FAT tables signature. Cannot reconstruct.\n";
+        return false;
+    }
+
+    // 3. TÍNH TOÁN CÁC THÔNG SỐ
+    cout << "   -> Reconstructing Boot Sector parameters...\n";
+
+    // A. Bytes Per Sector (Giả định chuẩn)
+    this->bootSector.bytesPerSector = 512;
+
+    // B. Sectors Per FAT
+    // Khoảng cách giữa 2 bảng FAT chia cho kích thước sector
+    uint64_t distanceBytes = fat2StartOffset - fat1StartOffset;
+    this->bootSector.sectorsPerFat = (uint32_t)(distanceBytes / 512);
+
+    // C. Number of FATs (Giả định chuẩn)
+    this->bootSector.numFATs = 2;
+
+    // D. Hidden Sectors (LBA First của partition)
+    this->bootSector.hiddenSectors = p.lbaFirst;
+
+    // E. Total Sectors (Lấy từ MBR)
+    this->bootSector.totalSectors32 = p.numSectors;
+
+    // F. Root Cluster (Thường là 2)
+    this->bootSector.rootCluster = 2;
+
+    // G. Sectors Per Cluster (SPC) - PHẦN KHÓ NHẤT
+    // Ta phải đoán (Brute-force). Các giá trị thường gặp: 1, 2, 4, 8, 16, 32, 64.
+    // Cách kiểm tra: Tính toán vùng Data, thử đọc Cluster 2 (Root).
+    // Nếu dữ liệu trông giống thư mục (có file hợp lệ), thì SPC đúng.
+
+    int possibleSPCs[] = {8, 16, 32, 64, 1, 2, 4, 128};
+    bool spcFound = false;
+
+    for (int spc : possibleSPCs)
+    {
+        this->bootSector.sectorsPerCluster = (uint8_t)spc;
+
+        // Cập nhật lại các biến offset toàn cục của class dựa trên SPC giả định này
+        this->fatBegin = fat1StartOffset;
+        uint64_t fatSize = (uint64_t)this->bootSector.sectorsPerFat * 512;
+        this->dataBegin = this->fatBegin + ((uint64_t)this->bootSector.numFATs * fatSize);
+
+        // Thử đọc Root Cluster (Cluster 2)
+        // Lưu ý: Cluster 2 nằm ngay đầu vùng Data
+        uint64_t rootOffset = this->dataBegin;
+
+        uint8_t rootBuf[512];
+        readBytes(rootOffset, rootBuf, 512);
+
+        // Kiểm tra xem sector này có phải là Directory không?
+        // Directory Entry hợp lệ:
+        // - Byte 0: Khác 0 (trừ khi trống hết), khác 0xE5 (nếu đã xóa)
+        // - Byte 11 (Attr): 0x10 (Subdir), 0x20 (Archive), 0x0F (LFN), ...
+        // - Name: Ký tự in được
+
+        // Kiểm tra entry đầu tiên
+        // Root dir thường chứa Volume Label (Attr 0x08) hoặc file/folder hệ thống
+        bool looksLikeDir = false;
+
+        // Kiểm tra sơ bộ 1 vài entry
+        for (int k = 0; k < 16; k++)
+        {
+            uint8_t attr = rootBuf[k * 32 + 11];
+            uint8_t firstChar = rootBuf[k * 32];
+
+            // Nếu tìm thấy một entry có attribute hợp lệ (Read only, Hidden, System, Vol, Dir, Archive)
+            // Và tên file là ký tự đọc được
+            if ((attr & 0x3F) != 0 && isalnum(firstChar))
+            {
+                looksLikeDir = true;
+                break;
+            }
+        }
+
+        if (looksLikeDir)
+        {
+            cout << "   -> Guessing SectorsPerCluster: " << spc << " [MATCHED Root Dir Content]\n";
+            spcFound = true;
+            break;
+        }
+    }
+
+    if (!spcFound)
+    {
+        cout << "   -> [WARN] Could not determine SectorsPerCluster. Defaulting to 8.\n";
+        this->bootSector.sectorsPerCluster = 8;
+    }
+
+    // 4. (Tùy chọn) Ghi Boot Sector "giả" này xuống đĩa để các tool khác đọc được
+    // Cần phải điền signature 0xAA55
+    uint8_t rebuildBuf[512];
+    memset(rebuildBuf, 0, 512);
+    memcpy(rebuildBuf, &this->bootSector, sizeof(BootSector)); // Copy struct 64 bytes
+
+    // Ghi Signature
+    rebuildBuf[510] = 0x55;
+    rebuildBuf[511] = 0xAA;
+
+    // Ghi Jump code (JMP SHORT 3C NOP) để Windows nhận diện là bootable (Optional)
+    rebuildBuf[0] = 0xEB;
+    rebuildBuf[1] = 0x58;
+    rebuildBuf[2] = 0x90;
+
+    // Ghi đè vào Sector 0
+    cout << "   -> Writing reconstructed Boot Sector to disk...\n";
+    vhd.clear();
+    vhd.seekp(partStartOffset, std::ios::beg);
+    vhd.write((char *)rebuildBuf, 512);
+    vhd.flush();
+
+    return true;
+}
+
 // ======================================================================
 //                       FILE SYSTEM (FAT32)
 // ======================================================================
 
-void FAT32Recovery::loadFAT()
+void FAT32Recovery::loadFAT(bool autoRepair)
 {
     // Đảm bảo các thông số đã được khởi tạo từ readBootSector/selectPartition
     if (bootSector.sectorsPerFat == 0 || bootSector.bytesPerSector == 0 || fatBegin == 0)
@@ -603,7 +777,6 @@ void FAT32Recovery::loadFAT()
 
     // Dọn dẹp: Đảm bảo luồng cout không bị ảnh hưởng bởi hex/dec
     cout << dec;
-    bool autoRepair = false;
     cout << "[SCAN] Checking directory and FAT structures with auto repair = " << autoRepair << "\n";
     scanAndAutoRepair(bootSector.rootCluster, autoRepair);
     cout << "================================\n";
@@ -922,7 +1095,14 @@ vector<DeletedFileInfo> FAT32Recovery::analyzeRecoveryCandidates(uint32_t dirClu
 {
     vector<DeletedFileInfo> candidates;
     vector<uint8_t> buf;
-    try { readCluster(dirCluster, buf); } catch (...) { return candidates; }
+    try
+    {
+        readCluster(dirCluster, buf);
+    }
+    catch (...)
+    {
+        return candidates;
+    }
 
     size_t numEntries = buf.size() / 32;
     uint32_t bytesPerCluster = bootSector.bytesPerSector * bootSector.sectorsPerCluster;
@@ -930,7 +1110,7 @@ vector<DeletedFileInfo> FAT32Recovery::analyzeRecoveryCandidates(uint32_t dirClu
     // --- BƯỚC 1: Thu thập (Census) ---
     for (size_t i = 0; i < numEntries; ++i)
     {
-        const DirEntry* entry = reinterpret_cast<const DirEntry*>(buf.data() + (i * 32));
+        const DirEntry *entry = reinterpret_cast<const DirEntry *>(buf.data() + (i * 32));
 
         // Chỉ lấy các entry đánh dấu xóa (0xE5) và không phải tên dài (LFN)
         if (entry->name[0] == 0xE5 && !entry->isLFN())
@@ -941,10 +1121,10 @@ vector<DeletedFileInfo> FAT32Recovery::analyzeRecoveryCandidates(uint32_t dirClu
             info.size = entry->fileSize;
             info.startCluster = entry->getStartCluster();
             info.isDir = entry->isdDir(); // Lấy cờ folder
-            
+
             // Lấy timestamps
             info.lastWriteTime = entry->getWriteTimestamp();
-            info.creationTime  = entry->getCreationTimestamp();
+            info.creationTime = entry->getCreationTimestamp();
 
             info.isRecoverable = true;
             info.statusReason = "Good";
@@ -959,32 +1139,36 @@ vector<DeletedFileInfo> FAT32Recovery::analyzeRecoveryCandidates(uint32_t dirClu
 
     for (int fileIdx = 0; fileIdx < (int)candidates.size(); ++fileIdx)
     {
-        auto& file = candidates[fileIdx];
-        if (file.size == 0) continue; // File rỗng không chiếm cluster
+        auto &file = candidates[fileIdx];
+        if (file.size == 0)
+            continue; // File rỗng không chiếm cluster
 
         uint32_t needed = (file.size + bytesPerCluster - 1) / bytesPerCluster;
-        
+
         // Giả định file liên tục (Contiguous Assumption)
         for (uint32_t c = 0; c < needed; ++c)
         {
             uint32_t currentClus = file.startCluster + c;
-            
+
             // Nếu cluster vượt quá giới hạn đĩa
-            if (currentClus >= totalClusters + 2) {
+            if (currentClus >= totalClusters + 2)
+            {
                 file.isRecoverable = false;
                 file.statusReason = "Invalid Range";
-                break; 
+                break;
             }
             clusterClaims[currentClus].push_back(fileIdx);
         }
     }
 
     // --- BƯỚC 3: Xử lý xung đột (Arbitration) ---
-    for (auto const& [clusterID, claimants] : clusterClaims)
+    for (auto const &[clusterID, claimants] : clusterClaims)
     {
         // A. Kiểm tra với bảng FAT thực tế (File đang sống)
-        if ((FAT[clusterID] & 0x0FFFFFFF) != 0) {
-            for (int idx : claimants) {
+        if ((FAT[clusterID] & 0x0FFFFFFF) != 0)
+        {
+            for (int idx : claimants)
+            {
                 candidates[idx].isRecoverable = false;
                 candidates[idx].statusReason = "Overwritten by Active File";
             }
@@ -1000,29 +1184,35 @@ vector<DeletedFileInfo> FAT32Recovery::analyzeRecoveryCandidates(uint32_t dirClu
             for (size_t i = 1; i < claimants.size(); ++i)
             {
                 int challengerIdx = claimants[i];
-                auto& winner = candidates[winnerIdx];
-                auto& challenger = candidates[challengerIdx];
+                auto &winner = candidates[winnerIdx];
+                auto &challenger = candidates[challengerIdx];
 
                 // === LOGIC: Creation vs Last Write ===
-                // Nếu B được TẠO RA (Created) sau khi A đã GHI XONG (LastWrite) 
+                // Nếu B được TẠO RA (Created) sau khi A đã GHI XONG (LastWrite)
                 // => B là kẻ đến sau đè lên A.
-                if (challenger.creationTime > winner.lastWriteTime) {
+                if (challenger.creationTime > winner.lastWriteTime)
+                {
                     winnerIdx = challengerIdx;
                 }
-                else if (winner.creationTime > challenger.lastWriteTime) {
+                else if (winner.creationTime > challenger.lastWriteTime)
+                {
                     // Winner vẫn thắng, không đổi
                 }
-                else {
+                else
+                {
                     // Fallback: Ai có Last Write mới hơn thì thắng
-                    if (challenger.lastWriteTime > winner.lastWriteTime) {
+                    if (challenger.lastWriteTime > winner.lastWriteTime)
+                    {
                         winnerIdx = challengerIdx;
                     }
                 }
             }
 
             // Loại bỏ những kẻ thua cuộc
-            for (int idx : claimants) {
-                if (idx != winnerIdx) {
+            for (int idx : claimants)
+            {
+                if (idx != winnerIdx)
+                {
                     candidates[idx].isRecoverable = false;
                     candidates[idx].statusReason = "Collision (Lost Time Check)";
                 }
@@ -1039,24 +1229,36 @@ bool FAT32Recovery::restoreDeletedFile(uint32_t dirCluster, int entryIndex, char
 
     // A. Đọc Directory Cluster
     vector<uint8_t> dirBuf;
-    try { readCluster(dirCluster, dirBuf); } catch (...) { return false; }
+    try
+    {
+        readCluster(dirCluster, dirBuf);
+    }
+    catch (...)
+    {
+        return false;
+    }
 
-    DirEntry* de = reinterpret_cast<DirEntry*>(dirBuf.data() + (entryIndex * 32));
-    if (de->name[0] != 0xE5) return false;
+    DirEntry *de = reinterpret_cast<DirEntry *>(dirBuf.data() + (entryIndex * 32));
+    if (de->name[0] != 0xE5)
+        return false;
 
     uint32_t start = de->getStartCluster();
     uint32_t size = de->fileSize;
     uint32_t bytesPerClus = bootSector.bytesPerSector * bootSector.sectorsPerCluster;
     uint32_t needed = (size + bytesPerClus - 1) / bytesPerClus;
-    if (size == 0) needed = 0;
+    if (size == 0)
+        needed = 0;
 
     // B. Chuẩn bị danh sách cluster cần chiếm (Claim List)
     vector<uint32_t> chainToClaim;
-    if (needed > 0) {
-        for (uint32_t i = 0; i < needed; i++) {
+    if (needed > 0)
+    {
+        for (uint32_t i = 0; i < needed; i++)
+        {
             uint32_t c = start + i;
             // Check an toàn lần cuối
-            if (c >= FAT.size() || (FAT[c] & 0x0FFFFFFF) != 0) {
+            if (c >= FAT.size() || (FAT[c] & 0x0FFFFFFF) != 0)
+            {
                 cerr << "[ERR] Collision detected at " << c << " during write phase. Aborting.\n";
                 return false;
             }
@@ -1065,8 +1267,10 @@ bool FAT32Recovery::restoreDeletedFile(uint32_t dirCluster, int entryIndex, char
     }
 
     // C. Verify (Optional): Đọc thử cluster đầu tiên kiểm tra Signature
-    if (!chainToClaim.empty() && !de->isdDir()) {
-        if (!verifyFileSignature(chainToClaim[0], de->getNameString())) {
+    if (!chainToClaim.empty() && !de->isdDir())
+    {
+        if (!verifyFileSignature(chainToClaim[0], de->getNameString()))
+        {
             cout << "[WARN] Signature mismatch. Restoring anyway but file might be junk.\n";
         }
     }
@@ -1075,12 +1279,14 @@ bool FAT32Recovery::restoreDeletedFile(uint32_t dirCluster, int entryIndex, char
 
     // 1. Sửa Dir Entry
     de->name[0] = (uint8_t)newChar;
-    
+
     // 2. Cập nhật FAT Chain
-    if (!chainToClaim.empty()) {
-        for (size_t i = 0; i < chainToClaim.size(); i++) {
+    if (!chainToClaim.empty())
+    {
+        for (size_t i = 0; i < chainToClaim.size(); i++)
+        {
             uint32_t cur = chainToClaim[i];
-            uint32_t next = (i == chainToClaim.size() - 1) ? 0x0FFFFFFF : chainToClaim[i+1];
+            uint32_t next = (i == chainToClaim.size() - 1) ? 0x0FFFFFFF : chainToClaim[i + 1];
             FAT[cur] = next;
         }
         writeFAT(); // Ghi 2 bảng FAT xuống đĩa
@@ -1090,7 +1296,7 @@ bool FAT32Recovery::restoreDeletedFile(uint32_t dirCluster, int entryIndex, char
     uint64_t dirOffset = cluster2Offset(dirCluster);
     vhd.clear();
     vhd.seekp(dirOffset, ios::beg);
-    vhd.write(reinterpret_cast<const char*>(dirBuf.data()), dirBuf.size());
+    vhd.write(reinterpret_cast<const char *>(dirBuf.data()), dirBuf.size());
     vhd.flush();
 
     return true;
@@ -1102,7 +1308,8 @@ void FAT32Recovery::restoreTree(uint32_t dirClusterOfParent, int entryIndex)
     cout << "\n[TREE] Starting recursive restore...\n";
 
     // Bước 1: Cứu cha trước
-    if (!restoreDeletedFile(dirClusterOfParent, entryIndex, '_')) {
+    if (!restoreDeletedFile(dirClusterOfParent, entryIndex, '_'))
+    {
         cout << "[TREE] Parent restore failed.\n";
         return;
     }
@@ -1110,9 +1317,10 @@ void FAT32Recovery::restoreTree(uint32_t dirClusterOfParent, int entryIndex)
     // Đọc lại để lấy start cluster chính xác (sau khi restore)
     vector<uint8_t> buf;
     readCluster(dirClusterOfParent, buf);
-    const DirEntry* de = reinterpret_cast<const DirEntry*>(buf.data() + (entryIndex * 32));
-    
-    if (de->isdDir()) {
+    const DirEntry *de = reinterpret_cast<const DirEntry *>(buf.data() + (entryIndex * 32));
+
+    if (de->isdDir())
+    {
         recursiveRestoreLoop(de->getStartCluster());
     }
 }
@@ -1120,11 +1328,11 @@ void FAT32Recovery::restoreTree(uint32_t dirClusterOfParent, int entryIndex)
 void FAT32Recovery::recursiveRestoreLoop(uint32_t currentDirCluster)
 {
     cout << "   >>> Diving into cluster " << currentDirCluster << "...\n";
-    
+
     // Bước 2: Quét tìm con bằng thuật toán Collision Check
     vector<DeletedFileInfo> children = analyzeRecoveryCandidates(currentDirCluster);
 
-    for (const auto& child : children)
+    for (const auto &child : children)
     {
         if (child.isRecoverable && child.name != "." && child.name != "..")
         {
@@ -1132,9 +1340,10 @@ void FAT32Recovery::recursiveRestoreLoop(uint32_t currentDirCluster)
             bool ok = restoreDeletedFile(currentDirCluster, child.entryIndex, '_');
 
             // Bước 4: Đệ quy nếu con là Folder
-            if (ok && child.isDir) {
+            if (ok && child.isDir)
+            {
                 // Tránh loop vô tận
-                if (child.startCluster != currentDirCluster && child.startCluster != 0) 
+                if (child.startCluster != currentDirCluster && child.startCluster != 0)
                     recursiveRestoreLoop(child.startCluster);
             }
         }
@@ -1146,18 +1355,29 @@ bool FAT32Recovery::verifyFileSignature(uint32_t startCluster, string filename)
 {
     // Lấy extension
     size_t dotPos = filename.find_last_of(".");
-    if (dotPos == string::npos) return true; // Không có đuôi -> bỏ qua check
+    if (dotPos == string::npos)
+        return true;                          // Không có đuôi -> bỏ qua check
     string ext = filename.substr(dotPos + 1); // Cần toUpper nếu muốn chắc chắn
 
     vector<uint8_t> buf;
-    try { readCluster(startCluster, buf); } catch(...) { return false; }
-    if (buf.size() < 4) return false;
+    try
+    {
+        readCluster(startCluster, buf);
+    }
+    catch (...)
+    {
+        return false;
+    }
+    if (buf.size() < 4)
+        return false;
 
     // Check mẫu vài loại phổ biến
-    if (ext == "JPG" || ext == "JPEG") return buf[0]==0xFF && buf[1]==0xD8;
-    if (ext == "PNG") return buf[0]==0x89 && buf[1]=='P' && buf[2]=='N' && buf[3]=='G';
-    
-    return true; 
+    if (ext == "JPG" || ext == "JPEG")
+        return buf[0] == 0xFF && buf[1] == 0xD8;
+    if (ext == "PNG")
+        return buf[0] == 0x89 && buf[1] == 'P' && buf[2] == 'N' && buf[3] == 'G';
+
+    return true;
 }
 // ======================================================================
 //                       Scanning & recovery routines
@@ -1166,66 +1386,80 @@ vector<uint32_t> FAT32Recovery::followFAT(uint32_t startCluster) const
 {
     vector<uint32_t> chain;
 
-    // Sử dụng Set để phát hiện vòng lặp vô tận (Infinite Loop)
-    // Trường hợp FAT bị lỗi: 5 -> 6 -> 7 -> 5 ...
+    // 0. Kiểm tra điều kiện tiên quyết
+    // Nếu bảng FAT chưa load hoặc startCluster là 0 (file rỗng), trả về rỗng ngay.
+    if (FAT.empty())
+    {
+        cerr << "[ERR] FAT table is not loaded yet.\n";
+        return chain;
+    }
+    if (startCluster == 0)
+    {
+        return chain; // File rỗng, không có lỗi
+    }
+
+    // Dự đoán kích thước vector để giảm chi phí cấp phát bộ nhớ liên tục
+    // (Optional: Giả sử file trung bình có vài cluster)
+    chain.reserve(32);
+
+    // Sử dụng Set để phát hiện vòng lặp (Safety mechanism)
     set<uint32_t> visited;
 
     uint32_t current = startCluster;
-
-    // FAT32 Mask: Chỉ dùng 28 bit thấp, 4 bit cao là reserved.
     const uint32_t FAT32_MASK = 0x0FFFFFFF;
-    const uint32_t EOC_MARK = 0x0FFFFFF8; // Giá trị >= mức này là kết thúc
-    const uint32_t BAD_CLUS = 0x0FFFFFF7; // Cluster hỏng
+    const uint32_t EOC_MARK = 0x0FFFFFF8;
+    const uint32_t BAD_CLUS = 0x0FFFFFF7;
 
     while (true)
     {
         // 1. Kiểm tra biên (Boundary Check)
-        // Cluster hợp lệ phải >= 2 và nằm trong kích thước bảng FAT
+        // Cluster < 2 là reserved (trừ khi tính toán sai), >= size là lỗi
         if (current < 2 || current >= FAT.size())
         {
-            // Nếu trỏ ra ngoài phạm vi -> Chuỗi bị đứt hoặc lỗi
+            cerr << "[WARN] Chain points to invalid cluster index: " << current << " (Out of FAT bounds)\n";
             break;
         }
 
         // 2. Kiểm tra vòng lặp (Loop Detection)
-        if (visited.count(current))
+        // Nếu cluster đã tồn tại trong set -> Có vòng lặp
+        if (visited.find(current) != visited.end())
         {
-            cout << "[Warning] FAT Cycle detected at cluster " << current << ". Stopping chain.\n";
+            cerr << "[WARN] FAT Cycle detected at cluster " << current << ". Cutting chain here.\n";
             break;
         }
 
-        // Ghi nhận cluster này
+        // Ghi nhận cluster
         visited.insert(current);
         chain.push_back(current);
 
-        // 3. Đọc giá trị tiếp theo từ bảng FAT
-        // Lưu ý: Phải dùng bitwise AND với 0x0FFFFFFF
+        // 3. Đọc giá trị tiếp theo
         uint32_t next = FAT[current] & FAT32_MASK;
 
-        // 4. Các điều kiện dừng (Termination Conditions)
+        // 4. Các điều kiện dừng
 
-        // A. End of Chain (EOC): Kết thúc file
+        // A. End of Chain (EOC)
         if (next >= EOC_MARK)
         {
+            // Đây là kết thúc bình thường, không cần log lỗi
             break;
         }
 
-        // B. Bad Cluster: Cluster bị đánh dấu hỏng
+        // B. Bad Cluster
         if (next == BAD_CLUS)
         {
-            cout << "[Warning] Encountered BAD CLUSTER marker.\n";
+            cerr << "[WARN] Chain hit BAD CLUSTER at index " << current << "\n";
             break;
         }
 
-        // C. Free Cluster (0): Chuỗi bị đứt gãy
-        // (Bình thường file đang tồn tại không được trỏ về 0, nếu có là do lỗi cấu trúc)
+        // C. Free Cluster (0) - Broken Chain
         if (next == 0)
         {
-            // cout << "[Warning] Chain broken (points to FREE) at " << curren\nt;
+            // Trong recovery, file đang có dữ liệu mà trỏ về 0 nghĩa là mất đoạn sau.
+            cerr << "[WARN] Chain broken (points to FREE/0) at cluster " << current << "\n";
             break;
         }
 
-        // 5. Nhảy tới cluster tiếp theo
+        // 5. Di chuyển tiếp
         current = next;
     }
 
