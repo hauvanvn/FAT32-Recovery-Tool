@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <algorithm>
 #include <array>
+#include <map>
 
 // ======================================================================
 //                           DIR ENTRY METHODS
@@ -95,6 +96,15 @@ string DirEntry::getNameString() const
     }
 }
 
+uint32_t DirEntry::getWriteTimestamp() const 
+{
+    return (uint32_t(date) << 16) | uint32_t(time);
+}
+
+uint32_t DirEntry::getCreationTimestamp() const 
+{
+    return (uint32_t(crtDate) << 16) | uint32_t(crtTime);
+}
 // ======================================================================
 //                        CONSTRUCTOR / DESTRUCTOR
 // ======================================================================
@@ -907,210 +917,247 @@ vector<uint32_t> FAT32Recovery::contiguousGuess(uint32_t startHint, uint32_t fil
 // ======================================================================
 //                       DELETED FILE RECOVERY
 // ======================================================================
-string FAT32Recovery::restoreDeletedName(const uint8_t name[11])
+// 1. PHÂN TÍCH XUNG ĐỘT (Collision Detection Strategy)
+vector<DeletedFileInfo> FAT32Recovery::analyzeRecoveryCandidates(uint32_t dirCluster)
 {
-    uint8_t tempName[11];
-    memcpy(tempName, name, 11);
-    if (tempName[0] == 0xE5)
-        tempName[0] = '_';
-    return formatShortName(tempName);
-}
-
-void FAT32Recovery::rawRecoverFile(uint32_t startCluster, uint32_t fileSize, const string &destPath)
-{
-    cout << "   -> Recovering: Start Cluster " << startCluster << ", Size " << fileSize << " bytes...\n";
-
-    // 1. Mở file đầu ra bằng ofstream (C++)
-    ofstream outFile(destPath, ios::binary | ios::trunc);
-    if (!outFile.is_open())
-    {
-        cout << "      [ERROR] Cannot create output file: " << destPath << "\n";
-        return;
-    }
-
-    uint32_t currentCluster = startCluster;
-    uint32_t bytesRemaining = fileSize;
-    uint32_t bytesPerClus = bootSector.sectorsPerCluster * bootSector.bytesPerSector;
-    vector<uint8_t> buffer;
-
-    while (bytesRemaining > 0)
-    {
-        // Kiểm tra an toàn: Tràn dải cluster
-        if (currentCluster >= totalClusters + 2)
-        {
-            cout << "      [WARN] Reached end of valid clusters.\n";
-            break;
-        }
-
-        // --- Logic: Consecutive Empty Cluster ---
-        // Nếu là cluster đầu tiên HOẶC cluster hiện tại trong FAT = 0 (trống)
-        bool isStart = (currentCluster == startCluster);
-        bool isFree = (currentCluster < FAT.size() && FAT[currentCluster] == 0);
-
-        if (isStart || isFree)
-        {
-            try
-            {
-                // Đọc data từ Disk Image
-                readCluster(currentCluster, buffer);
-
-                // Tính toán lượng byte cần ghi
-                size_t chunkSize = (bytesRemaining < bytesPerClus) ? bytesRemaining : bytesPerClus;
-
-                // Ghi ra file kết quả
-                outFile.write((char *)buffer.data(), chunkSize);
-
-                bytesRemaining -= chunkSize;
-            }
-            catch (exception &e)
-            {
-                cout << "      [ERROR] Reading cluster " << currentCluster << ": " << e.what() << "\n";
-                break;
-            }
-        }
-        else
-        {
-            // Nếu cluster này đã bị chiếm dụng (Allocated) bởi file khác -> Bỏ qua (Skip)
-            // cout << "      [Debug] Skipping allocated cluster " << currentCluste\nr;
-        }
-
-        // Tăng tuyến tính để tìm mảnh tiếp theo
-        currentCluster++;
-    }
-
-    outFile.close();
-    cout << "      [INFO] Saved to " << destPath << "\n";
-}
-
-void FAT32Recovery::recoverDeletedFilesInDir(uint32_t dirCluster, const string &outputFolder)
-{
-    // Tạo folder (Lệnh này phụ thuộc OS, trên Windows dùng mkdir)
-    string cmd = "mkdir \"" + outputFolder + "\"";
-    system(cmd.c_str());
-
-    cout << "[INFO] Scanning deleted files in Cluster " << dirCluster << "\n";
-
-    vector<uint32_t> dirChain = followFAT(dirCluster);
-    if (dirChain.empty())
-        dirChain.push_back(dirCluster);
-
+    vector<DeletedFileInfo> candidates;
     vector<uint8_t> buf;
-    for (uint32_t c : dirChain)
+    try { readCluster(dirCluster, buf); } catch (...) { return candidates; }
+
+    size_t numEntries = buf.size() / 32;
+    uint32_t bytesPerCluster = bootSector.bytesPerSector * bootSector.sectorsPerCluster;
+
+    // --- BƯỚC 1: Thu thập (Census) ---
+    for (size_t i = 0; i < numEntries; ++i)
     {
-        readCluster(c, buf);
-        for (size_t off = 0; off + 32 <= buf.size(); off += 32)
+        const DirEntry* entry = reinterpret_cast<const DirEntry*>(buf.data() + (i * 32));
+
+        // Chỉ lấy các entry đánh dấu xóa (0xE5) và không phải tên dài (LFN)
+        if (entry->name[0] == 0xE5 && !entry->isLFN())
         {
-            DirEntry de;
-            memcpy(&de, buf.data() + off, 32);
+            DeletedFileInfo info;
+            info.entryIndex = (int)i;
+            info.name = entry->getNameString();
+            info.size = entry->fileSize;
+            info.startCluster = entry->getStartCluster();
+            info.isDir = entry->isdDir(); // Lấy cờ folder
+            
+            // Lấy timestamps
+            info.lastWriteTime = entry->getWriteTimestamp();
+            info.creationTime  = entry->getCreationTimestamp();
 
-            if (de.name[0] == 0x00)
-                break; // Hết thư mục
+            info.isRecoverable = true;
+            info.statusReason = "Good";
 
-            // Logic nhận diện file xóa: Bắt đầu 0xE5 và không phải LFN
-            if (de.name[0] == 0xE5 && !de.isLFN())
-            {
-                string recName = restoreDeletedName(de.name);
-                uint32_t startClus = de.getStartCluster();
-                uint32_t fSize = de.fileSize;
-
-                // Basic validation để lọc rác
-                if (startClus >= 2 && fSize > 0 && fSize < 200 * 1024 * 1024)
-                {
-                    cout << "Found: " << recName << " (Start: " << startClus << ", Size: " << fSize << ")\n";
-                    string outPath = outputFolder + "/" + recName;
-                    rawRecoverFile(startClus, fSize, outPath);
-                }
-            }
+            candidates.push_back(info);
         }
     }
-}
 
-void FAT32Recovery::recoverAllRecursively(uint32_t cluster, const string &hostPath)
-{
-    // 1. Tạo thư mục trên máy tính (Host OS) để giữ đúng cấu trúc cây
-    // (Lưu ý: trên Windows dùng lệnh mkdir string, Linux dùng mkdir -p)
-    string cmd = "mkdir -p \"" + hostPath + "\""; // Linux/MacOS
-    // string cmd = "mkdir \"" + hostPath + "\""; // Windows (bạn tự điều chỉnh tùy OS)
-    system(cmd.c_str());
+    // --- BƯỚC 2: Map Cluster Claims ---
+    // Key: Cluster ID, Value: List of file indices wanting this cluster
+    map<uint32_t, vector<int>> clusterClaims;
 
-    cout << "[SCAN] Entering Directory Cluster: " << cluster << " -> " << hostPath << "\n";
-
-    // 2. Lấy nội dung thư mục (Directory Content)
-    vector<uint32_t> dirChain = followFAT(cluster);
-    if (dirChain.empty())
-        dirChain.push_back(cluster); // Fallback nếu FAT lỗi
-
-    vector<uint8_t> buf;
-    for (uint32_t c : dirChain)
+    for (int fileIdx = 0; fileIdx < (int)candidates.size(); ++fileIdx)
     {
-        // Đọc dữ liệu của cluster hiện tại trong chuỗi thư mục
-        try
+        auto& file = candidates[fileIdx];
+        if (file.size == 0) continue; // File rỗng không chiếm cluster
+
+        uint32_t needed = (file.size + bytesPerCluster - 1) / bytesPerCluster;
+        
+        // Giả định file liên tục (Contiguous Assumption)
+        for (uint32_t c = 0; c < needed; ++c)
         {
-            readCluster(c, buf);
+            uint32_t currentClus = file.startCluster + c;
+            
+            // Nếu cluster vượt quá giới hạn đĩa
+            if (currentClus >= totalClusters + 2) {
+                file.isRecoverable = false;
+                file.statusReason = "Invalid Range";
+                break; 
+            }
+            clusterClaims[currentClus].push_back(fileIdx);
         }
-        catch (...)
-        {
+    }
+
+    // --- BƯỚC 3: Xử lý xung đột (Arbitration) ---
+    for (auto const& [clusterID, claimants] : clusterClaims)
+    {
+        // A. Kiểm tra với bảng FAT thực tế (File đang sống)
+        if ((FAT[clusterID] & 0x0FFFFFFF) != 0) {
+            for (int idx : claimants) {
+                candidates[idx].isRecoverable = false;
+                candidates[idx].statusReason = "Overwritten by Active File";
+            }
             continue;
-        } // Bỏ qua nếu lỗi đọc đĩa
+        }
 
-        // Duyệt từng entry 32-byte
-        for (size_t off = 0; off + 32 <= buf.size(); off += 32)
+        // B. Kiểm tra xung đột giữa các file đã xóa (Deleted vs Deleted)
+        if (claimants.size() > 1)
         {
-            DirEntry de;
-            memcpy(&de, buf.data() + off, 32);
+            int winnerIdx = claimants[0];
 
-            if (de.name[0] == 0x00)
-                break; // Hết danh sách -> Dừng xử lý cluster này
-            if (de.isLFN())
-                continue; // Bỏ qua Long File Name entry
-
-            // Lấy tên (Short Name)
-            string name = formatShortName(de.name);
-
-            // ==========================================
-            // CASE 1: FILE ĐÃ XÓA (Byte đầu là 0xE5)
-            // ==========================================
-            if (de.isDeleted())
+            // So sánh từng cặp để tìm người chiến thắng
+            for (size_t i = 1; i < claimants.size(); ++i)
             {
-                // Chỉ phục hồi nếu nó KHÔNG phải là thư mục (Directory) đã xóa
-                // (Khôi phục thư mục đã xóa rất khó vì mất link, ở đây ta chỉ cứu FILE)
-                if (!de.isdDir())
-                {
-                    string recName = restoreDeletedName(de.name);
-                    uint32_t startClus = de.getStartCluster();
-                    uint32_t size = de.fileSize;
+                int challengerIdx = claimants[i];
+                auto& winner = candidates[winnerIdx];
+                auto& challenger = candidates[challengerIdx];
 
-                    // Validate cơ bản
-                    if (startClus >= 2 && size > 0 && size < 500 * 1024 * 1024)
-                    {
-                        string fullOutputPath = hostPath + "/" + recName;
-                        // Gọi hàm rawRecoverFile bạn đã viết trước đó
-                        rawRecoverFile(startClus, size, fullOutputPath);
+                // === LOGIC: Creation vs Last Write ===
+                // Nếu B được TẠO RA (Created) sau khi A đã GHI XONG (LastWrite) 
+                // => B là kẻ đến sau đè lên A.
+                if (challenger.creationTime > winner.lastWriteTime) {
+                    winnerIdx = challengerIdx;
+                }
+                else if (winner.creationTime > challenger.lastWriteTime) {
+                    // Winner vẫn thắng, không đổi
+                }
+                else {
+                    // Fallback: Ai có Last Write mới hơn thì thắng
+                    if (challenger.lastWriteTime > winner.lastWriteTime) {
+                        winnerIdx = challengerIdx;
                     }
                 }
             }
-            // ==========================================
-            // CASE 2: THƯ MỤC ĐANG TỒN TẠI (Đệ quy)
-            // ==========================================
-            else if (de.isdDir())
-            {
-                // RẤT QUAN TRỌNG: Bỏ qua "." và ".." để tránh lặp vô tận
-                if (name == "." || name == "..")
-                    continue;
 
-                uint32_t subDirCluster = de.getStartCluster();
-
-                // Validate cluster hợp lệ
-                if (subDirCluster >= 2)
-                {
-                    string newHostPath = hostPath + "/" + name;
-
-                    // GỌI ĐỆ QUY: Đi sâu vào thư mục con
-                    recoverAllRecursively(subDirCluster, newHostPath);
+            // Loại bỏ những kẻ thua cuộc
+            for (int idx : claimants) {
+                if (idx != winnerIdx) {
+                    candidates[idx].isRecoverable = false;
+                    candidates[idx].statusReason = "Collision (Lost Time Check)";
                 }
             }
         }
     }
+    return candidates;
+}
+
+// 2. KHÔI PHỤC TẠI CHỖ (In-Place Restore)
+bool FAT32Recovery::restoreDeletedFile(uint32_t dirCluster, int entryIndex, char newChar)
+{
+    cout << "[RESTORE] Processing entry " << entryIndex << " in dir " << dirCluster << "...\n";
+
+    // A. Đọc Directory Cluster
+    vector<uint8_t> dirBuf;
+    try { readCluster(dirCluster, dirBuf); } catch (...) { return false; }
+
+    DirEntry* de = reinterpret_cast<DirEntry*>(dirBuf.data() + (entryIndex * 32));
+    if (de->name[0] != 0xE5) return false;
+
+    uint32_t start = de->getStartCluster();
+    uint32_t size = de->fileSize;
+    uint32_t bytesPerClus = bootSector.bytesPerSector * bootSector.sectorsPerCluster;
+    uint32_t needed = (size + bytesPerClus - 1) / bytesPerClus;
+    if (size == 0) needed = 0;
+
+    // B. Chuẩn bị danh sách cluster cần chiếm (Claim List)
+    vector<uint32_t> chainToClaim;
+    if (needed > 0) {
+        for (uint32_t i = 0; i < needed; i++) {
+            uint32_t c = start + i;
+            // Check an toàn lần cuối
+            if (c >= FAT.size() || (FAT[c] & 0x0FFFFFFF) != 0) {
+                cerr << "[ERR] Collision detected at " << c << " during write phase. Aborting.\n";
+                return false;
+            }
+            chainToClaim.push_back(c);
+        }
+    }
+
+    // C. Verify (Optional): Đọc thử cluster đầu tiên kiểm tra Signature
+    if (!chainToClaim.empty() && !de->isdDir()) {
+        if (!verifyFileSignature(chainToClaim[0], de->getNameString())) {
+            cout << "[WARN] Signature mismatch. Restoring anyway but file might be junk.\n";
+        }
+    }
+
+    // D. THỰC HIỆN GHI (Write Phase)
+
+    // 1. Sửa Dir Entry
+    de->name[0] = (uint8_t)newChar;
+    
+    // 2. Cập nhật FAT Chain
+    if (!chainToClaim.empty()) {
+        for (size_t i = 0; i < chainToClaim.size(); i++) {
+            uint32_t cur = chainToClaim[i];
+            uint32_t next = (i == chainToClaim.size() - 1) ? 0x0FFFFFFF : chainToClaim[i+1];
+            FAT[cur] = next;
+        }
+        writeFAT(); // Ghi 2 bảng FAT xuống đĩa
+    }
+
+    // 3. Ghi lại Directory Cluster
+    uint64_t dirOffset = cluster2Offset(dirCluster);
+    vhd.clear();
+    vhd.seekp(dirOffset, ios::beg);
+    vhd.write(reinterpret_cast<const char*>(dirBuf.data()), dirBuf.size());
+    vhd.flush();
+
+    return true;
+}
+
+// 3. KHÔI PHỤC ĐỆ QUY (Recursive Tree)
+void FAT32Recovery::restoreTree(uint32_t dirClusterOfParent, int entryIndex)
+{
+    cout << "\n[TREE] Starting recursive restore...\n";
+
+    // Bước 1: Cứu cha trước
+    if (!restoreDeletedFile(dirClusterOfParent, entryIndex, '_')) {
+        cout << "[TREE] Parent restore failed.\n";
+        return;
+    }
+
+    // Đọc lại để lấy start cluster chính xác (sau khi restore)
+    vector<uint8_t> buf;
+    readCluster(dirClusterOfParent, buf);
+    const DirEntry* de = reinterpret_cast<const DirEntry*>(buf.data() + (entryIndex * 32));
+    
+    if (de->isdDir()) {
+        recursiveRestoreLoop(de->getStartCluster());
+    }
+}
+
+void FAT32Recovery::recursiveRestoreLoop(uint32_t currentDirCluster)
+{
+    cout << "   >>> Diving into cluster " << currentDirCluster << "...\n";
+    
+    // Bước 2: Quét tìm con bằng thuật toán Collision Check
+    vector<DeletedFileInfo> children = analyzeRecoveryCandidates(currentDirCluster);
+
+    for (const auto& child : children)
+    {
+        if (child.isRecoverable && child.name != "." && child.name != "..")
+        {
+            // Bước 3: Cứu con (In-place)
+            bool ok = restoreDeletedFile(currentDirCluster, child.entryIndex, '_');
+
+            // Bước 4: Đệ quy nếu con là Folder
+            if (ok && child.isDir) {
+                // Tránh loop vô tận
+                if (child.startCluster != currentDirCluster && child.startCluster != 0) 
+                    recursiveRestoreLoop(child.startCluster);
+            }
+        }
+    }
+}
+
+// Helper: Verify Signature đơn giản
+bool FAT32Recovery::verifyFileSignature(uint32_t startCluster, string filename)
+{
+    // Lấy extension
+    size_t dotPos = filename.find_last_of(".");
+    if (dotPos == string::npos) return true; // Không có đuôi -> bỏ qua check
+    string ext = filename.substr(dotPos + 1); // Cần toUpper nếu muốn chắc chắn
+
+    vector<uint8_t> buf;
+    try { readCluster(startCluster, buf); } catch(...) { return false; }
+    if (buf.size() < 4) return false;
+
+    // Check mẫu vài loại phổ biến
+    if (ext == "JPG" || ext == "JPEG") return buf[0]==0xFF && buf[1]==0xD8;
+    if (ext == "PNG") return buf[0]==0x89 && buf[1]=='P' && buf[2]=='N' && buf[3]=='G';
+    
+    return true; 
 }
 // ======================================================================
 //                       Scanning & recovery routines

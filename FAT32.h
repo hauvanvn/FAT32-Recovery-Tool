@@ -8,151 +8,143 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <map> // Thêm map cho xử lý xung đột
 
 using namespace std;
 
-// Ultils
+// Utils
 static inline uint16_t read_u16_le(const uint8_t *p) { return uint16_t(p[0]) | (uint16_t(p[1]) << 8); }
 static inline uint16_t read_u32_le(const uint8_t *p) { return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24); }
-// typedef signed long long ssize_t;
+typedef signed long long ssize_t;
+
+// Struct lưu thông tin file bị xóa (Dùng cho phân tích)
+struct DeletedFileInfo
+{
+    int entryIndex;         // Index trong Directory Cluster
+    string name;
+    uint32_t size;
+    uint32_t startCluster;
+    
+    // Timestamps để so sánh xung đột
+    uint32_t lastWriteTime; 
+    uint32_t creationTime;
+
+    bool isRecoverable;
+    string statusReason;    // Lý do (Good, Collision, Overwritten...)
+    bool isDir;             // Cờ đánh dấu là Folder
+};
 
 #pragma pack(push, 1)
-// Partition struct
-struct ParEntry
-{
-    uint8_t status;        // 0x80 = active
-    uint8_t chsFirst[3];   // CHS of first sector
-    uint8_t partitionType; // Partition type
-    uint8_t chsLast[3];    // CHS of last sector
-    uint32_t lbaFirst;     // LBA of first sector
-    uint32_t numSectors;   // Number of sectors
+struct ParEntry {
+    uint8_t status; uint8_t chsFirst[3]; uint8_t partitionType;
+    uint8_t chsLast[3]; uint32_t lbaFirst; uint32_t numSectors;
 };
 
-struct MBR
-{
-    uint8_t bootloader[446];
-    ParEntry partitions[4];
-    uint16_t signature; // 0xAA55
+struct MBR {
+    uint8_t bootloader[446]; ParEntry partitions[4]; uint16_t signature;
 };
 
-// Boot Sector
-struct BootSector
-{
-    uint8_t jumpBoot[3]; // offset 0x00
-    uint8_t oemName[8];  // offset 0x03
-
-    uint16_t bytesPerSector;   // offset 0x0B
-    uint8_t sectorsPerCluster; // offset 0x0D
-    uint16_t reservedSectors;  // offset 0x0E
-    uint8_t numFATs;           // offset 0x10
-    uint16_t rootEntryCount;   // offset 0x11 (always 0 in FAT32)
-    uint16_t totalSectors16;   // offset 0x13
-    uint8_t media;             // offset 0x15
-    uint16_t fatSize16;        // offset 0x16
-    uint16_t sectorsPerTrack;  // offset 0x18
-    uint16_t numHeads;         // offset 0x1A
-    uint32_t hiddenSectors;    // offset 0x1C   (important!)
-    uint32_t totalSectors32;   // offset 0x20   (important!)
-
-    // FAT32 Extended
-    uint32_t sectorsPerFat; // offset 0x24   (FAT size)
-    uint16_t extFlags;      // offset 0x28
-    uint16_t fsVersion;     // offset 0x2A
-    uint32_t rootCluster;   // offset 0x2C   (root dir)
-    uint16_t fsInfo;        // offset 0x30
-    uint16_t bkBootSector;  // offset 0x32
-    uint8_t reserved[12];   // offset 0x34
+struct BootSector {
+    uint8_t jumpBoot[3]; uint8_t oemName[8];
+    uint16_t bytesPerSector; uint8_t sectorsPerCluster; uint16_t reservedSectors;
+    uint8_t numFATs; uint16_t rootEntryCount; uint16_t totalSectors16;
+    uint8_t media; uint16_t fatSize16; uint16_t sectorsPerTrack; uint16_t numHeads;
+    uint32_t hiddenSectors; uint32_t totalSectors32;
+    uint32_t sectorsPerFat; uint16_t extFlags; uint16_t fsVersion;
+    uint32_t rootCluster; uint16_t fsInfo; uint16_t bkBootSector; uint8_t reserved[12];
 };
-#pragma pack(pop)
 
-// Directory struct
+// CẬP NHẬT STRUCT QUAN TRỌNG
 struct DirEntry
 {
-    uint8_t name[11];
-    uint8_t attr;
-    uint8_t reserved[10];
-    uint16_t time;
-    uint16_t date;
-    uint16_t firstClusterHigh;
-    uint16_t firstClusterLow;
-    uint32_t fileSize;
+    uint8_t name[11];           // 0x00
+    uint8_t attr;               // 0x0B
+    
+    // --- KHUI RESERVED RA ĐỂ LẤY CREATION TIME ---
+    uint8_t ntRes;              // 0x0C
+    uint8_t crtTimeTenth;       // 0x0D
+    uint16_t crtTime;           // 0x0E (Creation Time)
+    uint16_t crtDate;           // 0x10 (Creation Date)
+    uint16_t lastAccDate;       // 0x12
+    // ---------------------------------------------
+
+    uint16_t firstClusterHigh;  // 0x14
+    uint16_t time;              // 0x16 (Last Write Time)
+    uint16_t date;              // 0x18 (Last Write Date)
+    uint16_t firstClusterLow;   // 0x1A
+    uint32_t fileSize;          // 0x1C
 
     bool isDeleted() const;
     bool isLFN() const;
     bool isdDir() const;
     uint32_t getStartCluster() const;
     string getNameString() const;
+
+    // Helper lấy timestamp dạng số nguyên (Date << 16 | Time)
+    uint32_t getWriteTimestamp() const;
+    uint32_t getCreationTimestamp() const;
 };
+#pragma pack(pop)
 
 class FAT32Recovery
 {
 private:
-    // Disk
     fstream vhd;
     string imagePath;
-
-    // MBR
     MBR mbr;
-
-    // Boot Sector
     BootSector bootSector;
 
-    // Computed offsets
     uint32_t fatBegin;
     uint32_t dataBegin;
     uint32_t totalClusters;
-
-    // FAT
     vector<uint32_t> FAT;
 
-    // Low level read
     ssize_t readBytes(uint64_t offset, void *buf, size_t size) const;
     void writeAll(std::ostream &out, const void *buf, size_t size) const;
-
-    // format short 8.3 name
     static string formatShortName(const uint8_t name[11]);
-
-    // Boot sector parser and validator
     bool parseAndValidateBootSector(const uint8_t *buffer);
 
-    // I testing code here
-    void rawRecoverFile(uint32_t startCluster, uint32_t fileSize, const string &destPath);
-    string restoreDeletedName(const uint8_t name[11]);
+    // Helper cho đệ quy
+    void recursiveRestoreLoop(uint32_t currentDirCluster);
+    // Helper kiểm tra chữ ký file (Optional safety check)
+    bool verifyFileSignature(uint32_t startCluster, string filename);
 
 public:
-    FAT32Recovery(const string &path); // Construct
-    ~FAT32Recovery();                  // Deconstruct
+    FAT32Recovery(const string &path);
+    ~FAT32Recovery();
 
-    // MBR fields
+    // Init logic
     void readMBR();
     bool validateAndFixPartition(int index);
-
-    // Boot Sector fields
     void listPartition();
-    void readBootSector(int partitionID);                    // Boot sector paeser
-    bool fixBootSectorBackup(uint64_t partitionStartOffset); // Boot sector backup fixer
-
-    // FAT fields
-    void loadFAT(); // Load FAT table
+    void readBootSector(int partitionID);
+    bool fixBootSectorBackup(uint64_t partitionStartOffset);
+    void loadFAT();
+    
+    // Core FAT operations
     void writeFAT();
     void scanAndAutoRepair(uint32_t dirCluster, bool fix);
     int repairFolderAndClusters(uint32_t dirCluster);
     vector<uint32_t> contiguousGuess(uint32_t startCluster, uint32_t fileSize) const;
-
-    // Scanning & recovery routines
-    // void scanRoot();
-    // void scanDirectory(uint32_t startCluster);
     vector<uint32_t> followFAT(uint32_t startCluster) const;
-
-    // Recover file with given start cluster and file size (output -> outPath)
-    // Will write exactly fileSize bytes (so it truncates last cluster properly)
-    void recoverFile(uint32_t startCluster, uint32_t fileSize, const string &outPath);
-    void recoverDeletedFilesInDir(uint32_t dirCluster, const string &outputFolder);
-    void recoverAllRecursively(uint32_t cluster, const string &hostPath);
 
     // Utils
     uint64_t cluster2Offset(uint32_t cluster) const;
     void readCluster(uint32_t cluster, vector<uint8_t> &buffer) const;
+
+    // --- RECOVERY FUNCTIONS (NEW) ---
+    
+    // 1. Phân tích xung đột & tìm ứng viên (Collision Detection)
+    vector<DeletedFileInfo> analyzeRecoveryCandidates(uint32_t dirCluster);
+
+    // 2. Khôi phục 1 file/folder tại chỗ (In-Place)
+    bool restoreDeletedFile(uint32_t dirCluster, int entryIndex, char newChar);
+
+    // 3. Khôi phục đệ quy cả cây thư mục (Recursive Tree)
+    void restoreTree(uint32_t dirClusterOfParent, int entryIndex);
+
+    // 4. Xuất file ra ngoài (Export)
+    void recoverFile(uint32_t startCluster, uint32_t fileSize, const string &outPath);
 };
 
 #endif //__FAT32__
