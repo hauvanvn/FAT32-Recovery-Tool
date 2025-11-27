@@ -9,6 +9,9 @@
 #include <vector>
 #include <set>
 #include <map> // Thêm map cho xử lý xung đột
+#include <cstring>
+#include <stdexcept>
+#include <cerrno>
 
 using namespace std;
 
@@ -16,6 +19,14 @@ using namespace std;
 static inline uint16_t read_u16_le(const uint8_t *p) { return uint16_t(p[0]) | (uint16_t(p[1]) << 8); }
 static inline uint32_t read_u32_le(const uint8_t *p) { return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24); }
 typedef signed long long ssize_t;
+
+// Constants
+namespace FAT32Const {
+    const uint16_t SIGNATURE_LE = 0xAA55;
+    const uint8_t  PART_TYPE_FAT32_LBA = 0x0C; // Chuẩn LBA
+    const uint8_t  PART_TYPE_FAT32_CHS = 0x0B; // Chuẩn cũ
+    const uint64_t SECTOR_SIZE = 512;
+}
 
 // Struct lưu thông tin file bị xóa (Dùng cho phân tích)
 struct DeletedFileInfo
@@ -123,6 +134,7 @@ class FAT32Recovery
 private:
     fstream vhd;
     string imagePath;
+    uint64_t diskSize;
     MBR mbr;
     BootSector bootSector;
 
@@ -131,10 +143,14 @@ private:
     uint32_t totalClusters;
     vector<uint32_t> FAT;
 
+    bool isValidMBR(const MBR* mbrPtr) const;
+    bool isValidFAT32BS(const uint8_t* buffer) const;
+
     ssize_t readBytes(uint64_t offset, void *buf, size_t size) const;
+    void saveMBRToDisk();
+    
     void writeAll(std::ostream &out, const void *buf, size_t size) const;
     static string formatShortName(const uint8_t name[11]);
-    bool parseAndValidateBootSector(const uint8_t *buffer);
 
     // Helper cho đệ quy
     void recursiveRestoreLoop(uint32_t currentDirCluster);
@@ -146,10 +162,11 @@ public:
     ~FAT32Recovery();
 
     // Init logic
-    void readMBR();
-    bool validateAndFixPartition(int index);
-    void scanAndRebuildMBR();
-    void listPartition();
+    void initializeMBR(); 
+    bool checkMBR();
+    bool rebuildMBR();
+    void listPartitions() const;
+
     void readBootSector(int partitionID);
     bool fixBootSectorBackup(uint64_t partitionStartOffset, uint16_t backupSectorLocation = 6);
     bool reconstructBootSector(int partitionID);
