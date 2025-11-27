@@ -590,11 +590,11 @@ void FAT32Recovery::reconstructBPB(uint64_t partStartSector, uint32_t partSize)
     
     // Quét 4000 sector đầu của phân vùng
     for (int i = 1; i < 4000; i++) {
-        uint64_t absOffset = (partStartSector + i) * 512ULL;
+        uint64_t absOffset = (partStartSector + i) * 512;
         if (readBytes(absOffset, buffer, 512) != 512) break;
 
         // Signature đầu bảng FAT32: F8 FF FF 0F
-        if (read_u32_le(buffer) == 0x0FFFFFF8) { // Little Endian của F8 FF FF 0F
+        if (read_u32_le(buffer) == 0x0FFFFF8) { // Little Endian của F8 FF FF 0F
             if (!foundFAT1) {
                 cout << "      [Scan] Found Potential FAT1 at Sector +" << i << "\n";
                 fat1Offset = absOffset;
@@ -839,7 +839,30 @@ void FAT32Recovery::reconstructBPB(uint64_t partStartSector, uint32_t partSize)
 // ======================================================================
 //                       FILE SYSTEM (FAT32)
 // ======================================================================
-void FAT32Recovery::loadFAT()
+
+bool FAT32Recovery::readFAT(int index, vector<uint32_t> &out)
+{
+    out.resize(bootSector.sectorsPerFat * bootSector.bytesPerSector / 4);
+
+    uint64_t offset = fatBegin + (index - 1) * bootSector.sectorsPerFat * bootSector.bytesPerSector;
+
+    vhd.seekg(offset, ios::beg);
+    if (!vhd.read(reinterpret_cast<char *>(out.data()), out.size() * 4))
+        return false;
+
+    return true;
+}
+
+void FAT32Recovery::writeFAT_CopyFrom(const vector<uint32_t> &src)
+{
+    uint64_t offset = fatBegin; // FAT1 luôn nằm đầu tiên
+
+    vhd.seekp(offset, ios::beg);
+    vhd.write(reinterpret_cast<const char *>(src.data()), src.size() * 4);
+    vhd.flush();
+}
+
+void FAT32Recovery::loadFAT(bool autoRepair)
 {
     // Đảm bảo các thông số đã được khởi tạo từ readBootSector/selectPartition
     if (bootSector.sectorsPerFat == 0 || bootSector.bytesPerSector == 0 || fatBegin == 0)
@@ -879,7 +902,7 @@ void FAT32Recovery::loadFAT()
     {
         uint32_t entry0 = read_u32_le(fatBuffer.data());
         // Entry 0 của FAT32 đĩa cứng thường là 0x0FFFFF8 (Media Type F8)
-        if ((entry0 & 0x0FFFFFFF) == 0x0FFFFFF8 || (entry0 & 0x0FFFFFFF) == 0x0FFFFFF0)
+        if ((entry0 & 0x0FFFFF00) == 0x0FFFFF00)
         {
             isFATValid = true;
         }
@@ -895,23 +918,25 @@ void FAT32Recovery::loadFAT()
         if (readBytes(fat2Begin, fatBuffer.data(), fatSizeBytes) == (ssize_t)fatSizeBytes)
         {
             uint32_t entry0 = read_u32_le(fatBuffer.data());
-            if ((entry0 & 0x0FFFFFFF) == 0x0FFFFFF8 || (entry0 & 0x0FFFFFFF) == 0x0FFFFFF0)
+            if ((entry0 & 0x0FFFFF00) == 0x0FFFFF00)
             {
                 cout << "[SUCCESS] FAT2 is valid. Using FAT2 data.\n";
                 isFATValid = true;
 
-                // Tự động sửa FAT1 bằng FAT2
-                cout << "[FIX] Overwriting corrupted FAT1 with valid FAT2...\n";
-                vhd.seekp(fatBegin, ios::beg);
-                vhd.write((char *)fatBuffer.data(), fatSizeBytes);
-                vhd.flush();
+                // (Optional) Tự động sửa FAT1 bằng FAT2
+                if (autoRepair)
+                {
+                    cout << "[FIX] Overwriting corrupted FAT1 with valid FAT2...\n";
+                    vhd.seekp(fatBegin, ios::beg);
+                    vhd.write((char *)fatBuffer.data(), fatSizeBytes);
+                    vhd.flush();
+                }
             }
         }
     }
 
     if (!isFATValid)
     {
-        scanAndAutoRepair(bootSector.rootCluster, true);
         throw runtime_error("Critical Error: Both FAT tables are corrupted.");
     }
 
@@ -939,7 +964,8 @@ void FAT32Recovery::loadFAT()
 
     // Dọn dẹp: Đảm bảo luồng cout không bị ảnh hưởng bởi hex/dec
     cout << dec;
-    cout << "[SCAN] Checking directory and FAT structures\n";
+    cout << "[SCAN] Checking directory and FAT structures with auto repair = " << autoRepair << "\n";
+    scanAndAutoRepair(bootSector.rootCluster, autoRepair);
     cout << "================================\n";
 }
 
@@ -1040,7 +1066,8 @@ void FAT32Recovery::scanAndAutoRepair(uint32_t dirCluster, bool fix)
     if (hasError && fix)
     {
         cout << ">>> Repairing directory and FAT structures..." << endl;
-        repairFolderAndClusters(dirCluster); // phase 2
+        if (!FATRedundancyCheckAndRepair())      // phase 1
+            repairFolderAndClusters(dirCluster); // phase 2
     }
     else if (hasError)
     {
@@ -1050,6 +1077,105 @@ void FAT32Recovery::scanAndAutoRepair(uint32_t dirCluster, bool fix)
     {
         cout << ">>> No inconsistencies found." << endl;
     }
+}
+
+bool FAT32Recovery::FATRedundancyCheckAndRepair()
+{
+    cout << "[INFO] Damage Prevention and Redundancy Check...\n";
+
+    // 1. Load FAT1 & FAT2
+    vector<uint32_t> fat1, fat2;
+
+    if (!readFAT(1, fat1))
+    {
+        cerr << "[ERROR] Can't read FAT1!\n";
+        return false;
+    }
+
+    if (!readFAT(2, fat2))
+    {
+        cerr << "[ERROR] Cant's read FAT2!\n";
+        return false;
+    }
+
+    if (fat1.size() != fat2.size())
+    {
+        cerr << "[ERROR] FAT1 size not equal to FAT2 size -> Critical!\n";
+        return false;
+    }
+
+    bool fat1Ok = true;
+    bool fat2Ok = true;
+
+    // 2. Kiểm tra tính hợp lệ FAT1
+    for (size_t i = 2; i < fat1.size(); i++)
+    {
+        uint32_t v = fat1[i] & 0x0FFFFFFF;
+        if (v > 0x0FFFFFFF)
+        {
+            fat1Ok = false;
+            break;
+        }
+    }
+
+    // 3. Kiểm tra tính hợp lệ FAT2
+    for (size_t i = 2; i < fat2.size(); i++)
+    {
+        uint32_t v = fat2[i] & 0x0FFFFFFF;
+        if (v > 0x0FFFFFFF)
+        {
+            fat2Ok = false;
+            break;
+        }
+    }
+
+    // 4. Phân nhánh theo kết quả
+
+    // ----------------------------------------------------------
+    // FAT1 OK + FAT2 OK → chọn FAT1
+    // ----------------------------------------------------------
+    if (fat1Ok && fat2Ok)
+    {
+        cout << "[OK] FAT1 and FAT2 valid.\n";
+        FAT = fat1;
+        return true;
+    }
+
+    // ----------------------------------------------------------
+    // FAT1 hỏng nhưng FAT2 tốt → khôi phục
+    // ----------------------------------------------------------
+    if (!fat1Ok && fat2Ok)
+    {
+        cout << "[WARNING] FAT1 is broken - restoring from FAT2...\n";
+
+        // Sửa trong RAM
+        FAT = fat2;
+
+        // Sửa trên đĩa (ghi FAT2 đè FAT1)
+        writeFAT_CopyFrom(fat2);
+
+        cout << "[SUCCESS] FAT1 restored successfully.\n";
+        return true;
+    }
+
+    // ----------------------------------------------------------
+    // FAT1 tốt nhưng FAT2 hỏng → vẫn dùng FAT1
+    // ----------------------------------------------------------
+    if (fat1Ok && !fat2Ok)
+    {
+        cout << "[WARNING] FAT2 is broken – still using FAT1.\n";
+        FAT = fat1;
+        return true;
+    }
+
+    // ----------------------------------------------------------
+    // Cả 2 FAT đều hỏng → buộc chuyển sang Phase 2 (deep scan)
+    // ----------------------------------------------------------
+    cerr << "[ERROR] both FAT1 and FAT2 are broken!.\n";
+
+    // Dùng tạm FAT1 (dù corrupt) để directory scanning không crash
+    FAT = fat1;
+    return false;
 }
 
 // Sửa chữa các mục nhập thư mục (directory entries) và chuỗi FAT (FAT chains) bên dưới một cluster thư mục

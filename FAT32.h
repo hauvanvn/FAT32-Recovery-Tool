@@ -175,12 +175,14 @@ public:
     void reconstructBPB(uint64_t partStartSector, uint32_t partSize);
     void printVolumeInfo() const;
 
+
     // Core FAT operations
     void loadFAT(bool autoRepair);
     bool readFAT(int index, vector<uint32_t> &out);
     void writeFAT_CopyFrom(const vector<uint32_t> &src);
     void writeFAT();
     void scanAndAutoRepair(uint32_t dirCluster, bool fix);
+    bool FATRedundancyCheckAndRepair();
     int repairFolderAndClusters(uint32_t dirCluster);
     vector<uint32_t> contiguousGuess(uint32_t startCluster, uint32_t fileSize) const;
     vector<uint32_t> followFAT(uint32_t startCluster) const;
