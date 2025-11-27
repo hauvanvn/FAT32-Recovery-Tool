@@ -590,11 +590,11 @@ void FAT32Recovery::reconstructBPB(uint64_t partStartSector, uint32_t partSize)
     
     // Quét 4000 sector đầu của phân vùng
     for (int i = 1; i < 4000; i++) {
-        uint64_t absOffset = (partStartSector + i) * 512ULL;
+        uint64_t absOffset = (partStartSector + i) * 512;
         if (readBytes(absOffset, buffer, 512) != 512) break;
 
         // Signature đầu bảng FAT32: F8 FF FF 0F
-        if (read_u32_le(buffer) == 0x0FFFFFF8) { // Little Endian của F8 FF FF 0F
+        if (read_u32_le(buffer) == 0x0FFFFF8) { // Little Endian của F8 FF FF 0F
             if (!foundFAT1) {
                 cout << "      [Scan] Found Potential FAT1 at Sector +" << i << "\n";
                 fat1Offset = absOffset;
@@ -879,7 +879,7 @@ void FAT32Recovery::loadFAT()
     {
         uint32_t entry0 = read_u32_le(fatBuffer.data());
         // Entry 0 của FAT32 đĩa cứng thường là 0x0FFFFF8 (Media Type F8)
-        if ((entry0 & 0x0FFFFFFF) == 0x0FFFFFF8 || (entry0 & 0x0FFFFFFF) == 0x0FFFFFF0)
+        if ((entry0 & 0x0FFFFF00) == 0x0FFFFF00)
         {
             isFATValid = true;
         }
@@ -895,7 +895,7 @@ void FAT32Recovery::loadFAT()
         if (readBytes(fat2Begin, fatBuffer.data(), fatSizeBytes) == (ssize_t)fatSizeBytes)
         {
             uint32_t entry0 = read_u32_le(fatBuffer.data());
-            if ((entry0 & 0x0FFFFFFF) == 0x0FFFFFF8 || (entry0 & 0x0FFFFFFF) == 0x0FFFFFF0)
+            if ((entry0 & 0x0FFFFF00) == 0x0FFFFF00)
             {
                 cout << "[SUCCESS] FAT2 is valid. Using FAT2 data.\n";
                 isFATValid = true;
