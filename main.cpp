@@ -29,8 +29,8 @@ int main()
     string diskPath = "VHDFAT32.vhd"; // Mặc định
 
     cout << "=== FAT32 IN-PLACE RECOVERY TOOL ===\n";
-    // cout << "Enter disk path to open and recovery disk: ";
-    // cin >> diskPath;
+    cout << "Enter disk path to open and recovery disk: ";
+    cin >> diskPath;
     cout << "Opening disk image: " << diskPath << "\n\n";
 
     try
@@ -45,8 +45,8 @@ int main()
         // Giả sử ta chọn Partition đầu tiên (Index 0) để làm việc
         // Trong thực tế bạn có thể cho người dùng nhập cin >> partIndex
         int partIndex = 0;
-        // cout << "Select partition (0, 1, 2, 3): ";
-        // cin >> partIndex;
+        cout << "Select partition (0, 1, 2, 3): ";
+        cin >> partIndex;
         cout << "\n>>> Selecting Partition " << partIndex << "...\n";
 
         tool.initializeVolume(partIndex);
