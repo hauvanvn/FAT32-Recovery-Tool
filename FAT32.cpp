@@ -567,8 +567,16 @@ void FAT32Recovery::readBootSector(int partitionId)
     // Backup thường nằm ở Sector 6 so với đầu Partition
     if (!valid)
     {
-        cout << "[WARN] Main BS failed. Trying Backup at Sector 6...\n";
-        uint64_t backupOffset = partitionStartOffset + (6ULL * 512ULL);
+        uint16_t backupSectorLocation = 6;
+        uint16_t possibleLocation = read_u16_le(bsBuffer + 50);
+
+        if (possibleLocation > 0 && possibleLocation != 6 && possibleLocation < 64)
+        {
+            cout << "[INFO] Detected Backup Boot Sector location from BPB: Sector " << possibleLocation << "\n";
+            backupSectorLocation = possibleLocation;
+        }
+
+        uint64_t backupOffset = partitionStartOffset + ((uint64_t)backupSectorLocation * 512ULL);
 
         if (readBytes(backupOffset, bsBuffer, 512) == 512)
         {
@@ -576,7 +584,7 @@ void FAT32Recovery::readBootSector(int partitionId)
             {
                 cout << "[INFO] Backup Boot Sector OK.\n";
 
-                if (fixBootSectorBackup(partitionStartOffset))
+                if (fixBootSectorBackup(partitionStartOffset, backupSectorLocation))
                 {
                     cout << "[SUCCESS] Boot Sector fixed from Backup.\n";
                     valid = true;
@@ -620,20 +628,17 @@ void FAT32Recovery::readBootSector(int partitionId)
     cout << "================================\n";
 }
 
-bool FAT32Recovery::fixBootSectorBackup(uint64_t partitionStartOffset)
+bool FAT32Recovery::fixBootSectorBackup(uint64_t partitionStartOffset, uint16_t backupSectorLocation)
 {
-    uint8_t backupBS[512];
-    for (int i = 0; i < 4; i++)
+    if (partitionStartOffset == 0)
     {
-        if (mbr.partitions[i].partitionType == 0x0B || mbr.partitions[i].partitionType == 0x0C)
-        {
-            partitionStartOffset = (uint64_t)mbr.partitions[i].lbaFirst * 512ULL;
-            break;
-        }
+        cout << "[ERROR] Invalid partition start offset.\n";
+        return false;
     }
 
-    uint64_t backupOffset = partitionStartOffset + (6ULL * 512ULL); // Sector 6
-    uint64_t mainOffset = partitionStartOffset;                     // Sector 0
+    uint8_t backupBS[512];
+    uint64_t backupOffset = partitionStartOffset + ((uint64_t)backupSectorLocation * 512ULL);
+    uint64_t mainOffset = partitionStartOffset;
 
     // 1. Đọc Backup Boot Sector
     if (readBytes(backupOffset, backupBS, 512) != 512)
@@ -869,15 +874,55 @@ void FAT32Recovery::loadFAT(bool autoRepair)
          << hex << fatBegin << endl;
 
     // 2. Chuẩn bị buffer và đọc toàn bộ FAT table từ đĩa
+    //vector<uint8_t> fatBuffer(fatSizeBytes);
+
+    // ssize_t n = readBytes(fatBegin, fatBuffer.data(), fatSizeBytes);
+
+    // if (n != (ssize_t)fatSizeBytes)
+    // {
+    //     // Xử lý lỗi đọc
+    //     throw runtime_error("Failed to read entire FAT table from disk. Read " +
+    //                         to_string(n) + " of " + to_string(fatSizeBytes) + " bytes.");
+    // }
+
     vector<uint8_t> fatBuffer(fatSizeBytes);
+    bool isFATValid = false;
 
-    ssize_t n = readBytes(fatBegin, fatBuffer.data(), fatSizeBytes);
+    // Thử đọc FAT1
+    cout << "[INFO] Reading FAT1...\n";
+    if (readBytes(fatBegin, fatBuffer.data(), fatSizeBytes) == (ssize_t)fatSizeBytes) {
+        uint32_t entry0 = read_u32_le(fatBuffer.data());
+        // Entry 0 của FAT32 đĩa cứng thường là 0x0FFFFF8 (Media Type F8)
+        if ((entry0 & 0x0FFFFF00) == 0x0FFFFF00) { 
+            isFATValid = true;
+        }
+    }
 
-    if (n != (ssize_t)fatSizeBytes)
-    {
-        // Xử lý lỗi đọc
-        throw runtime_error("Failed to read entire FAT table from disk. Read " +
-                            to_string(n) + " of " + to_string(fatSizeBytes) + " bytes.");
+    // Nếu FAT1 lỗi, thử đọc FAT2 (Theo kiến trúc thực tế)
+    if (!isFATValid && bootSector.numFATs > 1) {
+        cout << "[WARN] FAT1 corrupted. Attempting to read FAT2 (Redundancy Check)...\n";
+        uint64_t fat2Begin = fatBegin + fatSizeBytes; // FAT2 nằm ngay sau FAT1
+        
+        // Tái sử dụng buffer để đọc FAT2
+        if (readBytes(fat2Begin, fatBuffer.data(), fatSizeBytes) == (ssize_t)fatSizeBytes) {
+            uint32_t entry0 = read_u32_le(fatBuffer.data());
+            if ((entry0 & 0x0FFFFF00) == 0x0FFFFF00) {
+                cout << "[SUCCESS] FAT2 is valid. Using FAT2 data.\n";
+                isFATValid = true;
+                
+                // (Optional) Tự động sửa FAT1 bằng FAT2
+                if (autoRepair) {
+                    cout << "[FIX] Overwriting corrupted FAT1 with valid FAT2...\n";
+                    vhd.seekp(fatBegin, ios::beg);
+                    vhd.write((char*)fatBuffer.data(), fatSizeBytes);
+                    vhd.flush();
+                }
+            }
+        }
+    }
+
+    if (!isFATValid) {
+        throw runtime_error("Critical Error: Both FAT tables are corrupted.");
     }
 
     // 3. Xử lý các FAT entry

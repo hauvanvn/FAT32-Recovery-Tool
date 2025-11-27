@@ -75,6 +75,15 @@ struct BootSector
     uint16_t fsInfo;
     uint16_t bkBootSector;
     uint8_t reserved[12];
+
+    uint8_t driveNumber;
+    uint8_t reserved1;
+    uint8_t extSignature;
+    uint32_t volSerial;
+    uint8_t volLabel[11];
+    uint8_t fsType[8];
+    uint8_t bootCode[420];
+    uint16_t bootSignature;
 };
 
 // CẬP NHẬT STRUCT QUAN TRỌNG
@@ -142,7 +151,7 @@ public:
     void scanAndRebuildMBR();
     void listPartition();
     void readBootSector(int partitionID);
-    bool fixBootSectorBackup(uint64_t partitionStartOffset);
+    bool fixBootSectorBackup(uint64_t partitionStartOffset, uint16_t backupSectorLocation = 6);
     bool reconstructBootSector(int partitionID);
     void loadFAT(bool autoRepair);
 
