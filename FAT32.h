@@ -21,10 +21,11 @@ static inline uint32_t read_u32_le(const uint8_t *p) { return uint32_t(p[0]) | (
 typedef signed long long ssize_t;
 
 // Constants
-namespace FAT32Const {
+namespace FAT32Const
+{
     const uint16_t SIGNATURE_LE = 0xAA55;
-    const uint8_t  PART_TYPE_FAT32_LBA = 0x0C; // Chuẩn LBA
-    const uint8_t  PART_TYPE_FAT32_CHS = 0x0B; // Chuẩn cũ
+    const uint8_t PART_TYPE_FAT32_LBA = 0x0C; // Chuẩn LBA
+    const uint8_t PART_TYPE_FAT32_CHS = 0x0B; // Chuẩn cũ
     const uint64_t SECTOR_SIZE = 512;
 }
 
@@ -143,8 +144,8 @@ private:
     uint32_t totalClusters;
     vector<uint32_t> FAT;
 
-    bool isValidMBR(const MBR* mbrPtr) const;
-    bool isValidFAT32BS(const uint8_t* buffer) const;
+    bool isValidMBR(const MBR *mbrPtr) const;
+    bool isValidFAT32BS(const uint8_t *buffer) const;
 
     ssize_t readBytes(uint64_t offset, void *buf, size_t size) const;
     void saveMBRToDisk();
@@ -165,7 +166,7 @@ public:
     ~FAT32Recovery();
 
     // Init logic
-    void initializeMBR(); 
+    void initializeMBR();
     bool checkMBR();
     bool rebuildMBR();
     void listPartitions() const;
@@ -176,9 +177,7 @@ public:
     void printVolumeInfo() const;
 
     // Core FAT operations
-    void loadFAT(bool autoRepair);
-    bool readFAT(int index, vector<uint32_t> &out);
-    void writeFAT_CopyFrom(const vector<uint32_t> &src);
+    void loadFAT();
     void writeFAT();
     void scanAndAutoRepair(uint32_t dirCluster, bool fix);
     int repairFolderAndClusters(uint32_t dirCluster);
