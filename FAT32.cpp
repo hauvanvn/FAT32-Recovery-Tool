@@ -211,7 +211,7 @@ void FAT32Recovery::saveMBRToDisk()
 {
     vhd.clear();
     vhd.seekp(0, ios::beg);
-    vhd.write(reinterpret_cast<const char*>(&mbr), sizeof(MBR));
+    vhd.write(reinterpret_cast<const char *>(&mbr), sizeof(MBR));
     vhd.flush();
     cout << "[INFO] New MBR written to disk.\n";
 }
@@ -221,19 +221,21 @@ void FAT32Recovery::listPartitions() const
     cout << "------------------------------------------------\n";
     cout << " CURRENT PARTITION TABLE STATUS\n";
     cout << "------------------------------------------------\n";
-    for (int i = 0; i < 4; i++) {
-        const ParEntry& p = mbr.partitions[i];
-        if (p.numSectors == 0) continue;
+    for (int i = 0; i < 4; i++)
+    {
+        const ParEntry &p = mbr.partitions[i];
+        if (p.numSectors == 0)
+            continue;
 
-        cout << " Partition #" << i << ": Start LBA=" << p.lbaFirst 
-             << " | Size=" << p.numSectors 
-             << " | Type=0x" << hex << (int)p.partitionType << dec 
+        cout << " Partition #" << i << ": Start LBA=" << p.lbaFirst
+             << " | Size=" << p.numSectors
+             << " | Type=0x" << hex << (int)p.partitionType << dec
              << (p.status == 0x80 ? " (Active)" : "") << endl;
     }
     cout << "------------------------------------------------\n";
 }
 
-void FAT32Recovery::parseBPB(const uint8_t* buffer)
+void FAT32Recovery::parseBPB(const uint8_t *buffer)
 {
     // Copy 512 byte raw vào struct BootSector
     // (Giả sử struct BootSector đã được pack 1 byte chuẩn)
@@ -244,7 +246,7 @@ void FAT32Recovery::saveBootSector(uint64_t offset)
 {
     vhd.clear();
     vhd.seekp(offset, ios::beg);
-    vhd.write(reinterpret_cast<const char*>(&bootSector), sizeof(BootSector));
+    vhd.write(reinterpret_cast<const char *>(&bootSector), sizeof(BootSector));
     vhd.flush();
     cout << "[INFO] Boot Sector written to disk at offset " << offset << ".\n";
 }
@@ -267,7 +269,7 @@ void FAT32Recovery::printVolumeInfo() const
 // =====================================================================
 //                       HELPER: VALIDATOR FUNCTIONS
 // =====================================================================
-bool FAT32Recovery::isValidMBR(const MBR* mbrPtr) const
+bool FAT32Recovery::isValidMBR(const MBR *mbrPtr) const
 {
     // Kiểm tra chữ ký MBR
     if (mbrPtr->signature != FAT32Const::SIGNATURE_LE)
@@ -291,38 +293,46 @@ bool FAT32Recovery::isValidMBR(const MBR* mbrPtr) const
     return hasFAT32;
 }
 
-bool FAT32Recovery::isValidFAT32BS(const uint8_t* buffer) const
+bool FAT32Recovery::isValidFAT32BS(const uint8_t *buffer) const
 {
     // Check Signature 0xAA55 ở cuối sector
     uint16_t sig = read_u16_le(buffer + 510);
-    if (sig != FAT32Const::SIGNATURE_LE) return false;
+    if (sig != FAT32Const::SIGNATURE_LE)
+        return false;
 
     // Check chuỗi "FAT32   " ở offset 82 (0x52)
     // Đây là dấu hiệu nhận biết Boot Sector của FAT32, phân biệt với NTFS/MBR
-    if (memcmp(buffer + 0x52, "FAT32", 5) != 0) return false;
+    if (memcmp(buffer + 0x52, "FAT32", 5) != 0)
+        return false;
 
     // Sanity Check (Kiểm tra tính hợp lý của thông số)
-    const BootSector* bs = reinterpret_cast<const BootSector*>(buffer);
+    const BootSector *bs = reinterpret_cast<const BootSector *>(buffer);
 
     // Bytes Per Sector phải chuẩn (thường là 512)
-    if (bs->bytesPerSector != 512 && bs->bytesPerSector != 1024 && 
-        bs->bytesPerSector != 2048 && bs->bytesPerSector != 4096) return false;
-    
+    if (bs->bytesPerSector != 512 && bs->bytesPerSector != 1024 &&
+        bs->bytesPerSector != 2048 && bs->bytesPerSector != 4096)
+        return false;
+
     // Cluster Size phải > 0
     if (bs->sectorsPerCluster == 0 || bs->sectorsPerCluster > 128 ||
-        (bs->sectorsPerCluster & (bs->sectorsPerCluster - 1)) != 0) return false;
+        (bs->sectorsPerCluster & (bs->sectorsPerCluster - 1)) != 0)
+        return false;
 
     // Reserved Sectors phải > 0
-    if (bs->reservedSectors == 0) return false;
+    if (bs->reservedSectors == 0)
+        return false;
 
     // Total Sectors phải > 0 (Nếu = 0 thì volume rỗng -> rác)
-    if (bs->totalSectors32 == 0) return false;
+    if (bs->totalSectors32 == 0)
+        return false;
 
     // Sectors Per FAT phải > 0
-    if (bs->numFATs < 1 || bs->numFATs > 2) return false;
+    if (bs->numFATs < 1 || bs->numFATs > 2)
+        return false;
 
     // Root Cluster phải >= 2
-    if (bs->rootCluster < 2) return false;
+    if (bs->rootCluster < 2)
+        return false;
 
     return true;
 }
@@ -335,7 +345,8 @@ void FAT32Recovery::initializeMBR()
     cout << "\n=== MASTER BOOT RECORD (MBR) RECOVERY ===\n";
 
     // BƯỚC 1: Kiểm tra Sector 0 xem có dùng được không
-    if (checkMBR()) {
+    if (checkMBR())
+    {
         cout << "[SUCCESS] Primary MBR is valid.\n";
         listPartitions();
         return; // Xong, không cần làm gì thêm
@@ -343,7 +354,8 @@ void FAT32Recovery::initializeMBR()
 
     // BƯỚC 2: Nếu Sector 0 hỏng, quét đĩa để dựng lại (Bỏ qua tìm Backup)
     cout << "[WARN] Primary MBR corrupted or empty. Starting Deep Scan...\n";
-    if (rebuildMBR()) {
+    if (rebuildMBR())
+    {
         cout << "[SUCCESS] MBR rebuilt from found volumes.\n";
         listPartitions();
         return;
@@ -356,13 +368,15 @@ void FAT32Recovery::initializeMBR()
 bool FAT32Recovery::checkMBR()
 {
     // Đọc Sector 0 vào biến thành viên `mbr`
-    if (readBytes(0, &mbr, sizeof(MBR)) != sizeof(MBR)) {
+    if (readBytes(0, &mbr, sizeof(MBR)) != sizeof(MBR))
+    {
         cerr << "[ERR] Read Sector 0 failed.\n";
         return false;
     }
 
     // Dùng Validator đã tách riêng để kiểm tra
-    if (!isValidMBR(&mbr)) {
+    if (!isValidMBR(&mbr))
+    {
         cout << "[INFO] Sector 0 is invalid (Signature mismatch or no FAT32 partitions).\n";
         return false;
     }
@@ -379,46 +393,51 @@ bool FAT32Recovery::rebuildMBR()
     int partitionsFound = 0;
     uint8_t buf[512];
     uint64_t currentSector = 0;
-    
+
     // Giới hạn quét: Toàn bộ đĩa
     uint64_t maxSectors = diskSize / FAT32Const::SECTOR_SIZE;
-    
+
     cout << "   -> Scanning " << maxSectors << " sectors for FAT32 Signatures...\n";
 
-    while (currentSector < maxSectors && partitionsFound < 4) 
+    while (currentSector < maxSectors && partitionsFound < 4)
     {
         // Bỏ qua Sector 0 (vì ta biết nó lỗi rồi mới vào đây)
-        if (currentSector == 0) { currentSector++; continue; }
+        if (currentSector == 0)
+        {
+            currentSector++;
+            continue;
+        }
 
         // Đọc sector
-        if (readBytes(currentSector * 512, buf, 512) != 512) break;
+        if (readBytes(currentSector * 512, buf, 512) != 512)
+            break;
 
         // --- SỬ DỤNG HÀM VALIDATOR ĐÃ TÁCH ---
         // Nếu đây là một Boot Sector chuẩn FAT32
-        if (isValidFAT32BS(buf)) 
+        if (isValidFAT32BS(buf))
         {
             // Lấy kích thước volume từ Boot Sector tìm được
-            const BootSector* bs = reinterpret_cast<const BootSector*>(buf);
+            const BootSector *bs = reinterpret_cast<const BootSector *>(buf);
             uint32_t volSize = bs->totalSectors32;
-            
-            cout << "   [+] Found Valid FAT32 Volume at Sector " << currentSector 
+
+            cout << "   [+] Found Valid FAT32 Volume at Sector " << currentSector
                  << " | Size: " << volSize << "\n";
 
             // Điền thông tin vào MBR Partition Table
-            ParEntry& p = mbr.partitions[partitionsFound];
-            
-            p.status = (partitionsFound == 0) ? 0x80 : 0x00; // Active partition đầu tiên
+            ParEntry &p = mbr.partitions[partitionsFound];
+
+            p.status = (partitionsFound == 0) ? 0x80 : 0x00;   // Active partition đầu tiên
             p.partitionType = FAT32Const::PART_TYPE_FAT32_LBA; // Type 0x0C
             p.lbaFirst = (uint32_t)currentSector;
             p.numSectors = volSize;
-            
+
             partitionsFound++;
 
             // QUAN TRỌNG: Nhảy qua volume này để tìm cái tiếp theo
             // Tránh việc quét trùng lặp bên trong volume vừa tìm thấy
             currentSector += volSize;
-        } 
-        else 
+        }
+        else
         {
             // Không phải Boot Sector -> Nhảy tiếp
             // Tối ưu: Nếu đang ở đầu volume, nhảy 1 sector.
@@ -428,7 +447,8 @@ bool FAT32Recovery::rebuildMBR()
     }
 
     // Nếu tìm thấy ít nhất 1 partition -> Ghi MBR mới xuống đĩa
-    if (partitionsFound > 0) {
+    if (partitionsFound > 0)
+    {
         saveMBRToDisk();
         return true;
     }
@@ -443,44 +463,50 @@ bool FAT32Recovery::initializeVolume(int partitionIndex)
     cout << "\n=== VOLUME PARAMETER RECOVERY (PARTITION " << partitionIndex << ") ===\n";
 
     // 1. Lấy thông tin LBA từ MBR (Mỏ neo vật lý)
-    if (partitionIndex < 0 || partitionIndex > 3) return false;
-    ParEntry& p = mbr.partitions[partitionIndex];
+    if (partitionIndex < 0 || partitionIndex > 3)
+        return false;
+    ParEntry &p = mbr.partitions[partitionIndex];
 
-    if (p.numSectors == 0) {
+    if (p.numSectors == 0)
+    {
         cout << "[ERR] Partition entry is empty.\n";
         return false;
     }
 
     // Tính Offset bắt đầu phân vùng
     uint64_t partitionStartOffset = (uint64_t)p.lbaFirst * FAT32Const::SECTOR_SIZE;
-    
-    cout << "[INFO] Partition Start LBA: " << p.lbaFirst 
+
+    cout << "[INFO] Partition Start LBA: " << p.lbaFirst
          << " (Offset: " << partitionStartOffset << ")\n";
 
     // 2. Cố gắng Load Boot Sector (Main -> Backup -> Reconstruct)
     bool bsLoaded = false;
 
     // Check Main & Backup
-    if (checkAndFixBootSector(p.lbaFirst)) {
+    if (checkAndFixBootSector(p.lbaFirst))
+    {
         cout << "[SUCCESS] Boot Sector loaded from disk.\n";
         bsLoaded = true;
-    } 
+    }
     // Nếu thất bại -> Reconstruct
-    else {
+    else
+    {
         cout << "[WARN] Boot Sectors corrupted. Reconstructing...\n";
         reconstructBPB(p.lbaFirst, p.numSectors); // Hàm này đã sửa ở câu trả lời trước
         cout << "[SUCCESS] Boot Sector reconstructed.\n";
         bsLoaded = true;
     }
 
-    if (!bsLoaded) return false;
-    
+    if (!bsLoaded)
+        return false;
+
     // Đảm bảo bytesPerSector hợp lệ để tránh chia cho 0 (Reconstruct đã set mặc định 512)
-    if (bootSector.bytesPerSector == 0) bootSector.bytesPerSector = 512;
+    if (bootSector.bytesPerSector == 0)
+        bootSector.bytesPerSector = 512;
 
     // A. Tính fatBegin
     // fatBegin = Start_Partition + Reserved_Size
-    this->fatBegin = partitionStartOffset + 
+    this->fatBegin = partitionStartOffset +
                      ((uint64_t)bootSector.reservedSectors * bootSector.bytesPerSector);
 
     // B. Tính dataBegin
@@ -495,16 +521,22 @@ bool FAT32Recovery::initializeVolume(int partitionIndex)
 
     uint64_t reservedArea = bootSector.reservedSectors;
     uint64_t fatArea = (uint64_t)bootSector.numFATs * bootSector.sectorsPerFat;
-    
-    if (totalSecs > (reservedArea + fatArea)) {
+
+    if (totalSecs > (reservedArea + fatArea))
+    {
         uint64_t dataSectors = totalSecs - reservedArea - fatArea;
-        
-        if (bootSector.sectorsPerCluster > 0) {
+
+        if (bootSector.sectorsPerCluster > 0)
+        {
             this->totalClusters = dataSectors / bootSector.sectorsPerCluster;
-        } else {
+        }
+        else
+        {
             this->totalClusters = 0;
         }
-    } else {
+    }
+    else
+    {
         this->totalClusters = 0;
         cout << "[ERR] Calculated Data Area is negative or zero. Geometry invalid.\n";
         return false;
@@ -514,26 +546,29 @@ bool FAT32Recovery::initializeVolume(int partitionIndex)
     cout << "   -> FAT Begin Offset:  " << this->fatBegin << "\n";
     cout << "   -> Data Begin Offset: " << this->dataBegin << "\n";
     cout << "   -> Total Clusters:    " << this->totalClusters << "\n";
-    
+
     printVolumeInfo();
     return true;
 }
-
 
 bool FAT32Recovery::checkAndFixBootSector(uint64_t partStartSector)
 {
     uint8_t buf[512];
     uint64_t mainOffset = partStartSector * FAT32Const::SECTOR_SIZE;
-    
+
     // --- BƯỚC 1: KIỂM TRA MAIN BOOT SECTOR ---
     // "BR appears to be greatly important"
-    if (readBytes(mainOffset, buf, 512) == 512) {
+    if (readBytes(mainOffset, buf, 512) == 512)
+    {
         // Dùng Validator đã viết ở Phase 1 để kiểm tra
-        if (isValidFAT32BS(buf)) {
+        if (isValidFAT32BS(buf))
+        {
             cout << "[SUCCESS] Main Boot Sector is healthy.\n";
             parseBPB(buf); // Load vào bộ nhớ
             return true;
-        } else {
+        }
+        else
+        {
             cout << "[FAIL] Main Boot Sector is invalid/corrupted.\n";
         }
     }
@@ -542,23 +577,27 @@ bool FAT32Recovery::checkAndFixBootSector(uint64_t partStartSector)
     // "Copies of BR are usually at the top... finding it doesn't take much time"
     // Với FAT32, vị trí mặc định là Sector 6 so với đầu phân vùng.
     uint64_t backupOffset = (partStartSector + 6) * FAT32Const::SECTOR_SIZE;
-    
-    if (readBytes(backupOffset, buf, 512) == 512) {
+
+    if (readBytes(backupOffset, buf, 512) == 512)
+    {
         // Kiểm tra bản sao này
-        if (isValidFAT32BS(buf)) {
+        if (isValidFAT32BS(buf))
+        {
             cout << "[SUCCESS] Found valid Backup Boot Sector at +6.\n";
-            
+
             // "Copy it back to the MBR" (ở đây là BR)
             cout << "[FIX] Restoring Backup to Main Boot Sector...\n";
-            
+
             // 1. Load vào bộ nhớ
             parseBPB(buf);
-            
+
             // 2. Ghi đè lên vị trí Main BS hỏng
             saveBootSector(mainOffset);
-            
+
             return true;
-        } else {
+        }
+        else
+        {
             cout << "[FAIL] Backup Boot Sector is also corrupted.\n";
         }
     }
@@ -569,10 +608,10 @@ bool FAT32Recovery::checkAndFixBootSector(uint64_t partStartSector)
 void FAT32Recovery::reconstructBPB(uint64_t partStartSector, uint32_t partSize)
 {
     cout << "   -> Attempting Advanced Reconstruction (Scanning for FAT signatures)...\n";
-    
+
     // Xóa sạch struct
     memset(&bootSector, 0, sizeof(BootSector));
-    
+
     // 1. Điền các tham số cơ bản (Mặc định)
     bootSector.bytesPerSector = 512;
     bootSector.numFATs = 2;
@@ -582,25 +621,31 @@ void FAT32Recovery::reconstructBPB(uint64_t partStartSector, uint32_t partSize)
 
     // 2. TẬN DỤNG LOGIC CŨ: Quét tìm bảng FAT để xác định Reserved Sectors
     // (Logic cũ của bạn nằm trong reconstructBootSector cũ)
-    
+
     uint8_t buffer[512];
     uint64_t fat1Offset = 0;
     uint64_t fat2Offset = 0;
     bool foundFAT1 = false;
-    
+
     // Quét 4000 sector đầu của phân vùng
-    for (int i = 1; i < 4000; i++) {
+    for (int i = 1; i < 4000; i++)
+    {
         uint64_t absOffset = (partStartSector + i) * 512;
-        if (readBytes(absOffset, buffer, 512) != 512) break;
+        if (readBytes(absOffset, buffer, 512) != 512)
+            break;
 
         // Signature đầu bảng FAT32: F8 FF FF 0F
-        if (read_u32_le(buffer) == 0x0FFFFF8) { // Little Endian của F8 FF FF 0F
-            if (!foundFAT1) {
+        if (read_u32_le(buffer) == 0x0FFFFF8)
+        { // Little Endian của F8 FF FF 0F
+            if (!foundFAT1)
+            {
                 cout << "      [Scan] Found Potential FAT1 at Sector +" << i << "\n";
                 fat1Offset = absOffset;
                 bootSector.reservedSectors = (uint16_t)i; // Tìm ra Reserved Sectors!
                 foundFAT1 = true;
-            } else {
+            }
+            else
+            {
                 cout << "      [Scan] Found Potential FAT2 at Sector +" << i << "\n";
                 fat2Offset = absOffset;
                 break; // Tìm thấy 2 bảng là đủ
@@ -609,11 +654,14 @@ void FAT32Recovery::reconstructBPB(uint64_t partStartSector, uint32_t partSize)
     }
 
     // 3. Tính toán Sectors Per FAT
-    if (fat1Offset > 0 && fat2Offset > 0) {
+    if (fat1Offset > 0 && fat2Offset > 0)
+    {
         uint64_t dist = fat2Offset - fat1Offset;
         bootSector.sectorsPerFat = (uint32_t)(dist / 512);
         cout << "      [Calc] Calculated FAT Size: " << bootSector.sectorsPerFat << " sectors.\n";
-    } else {
+    }
+    else
+    {
         // Fallback: Nếu không tìm thấy FAT, dùng công thức ước lượng (như câu trả lời trước)
         cout << "      [Warn] Cannot find FAT tables. Using estimation.\n";
         bootSector.sectorsPerFat = (partSize / 8 / 128); // Ước lượng thô
@@ -627,26 +675,32 @@ void FAT32Recovery::reconstructBPB(uint64_t partStartSector, uint32_t partSize)
     // Tính offset bắt đầu vùng FAT
     uint64_t fatStart = partStartSector * 512 + (uint64_t)bootSector.reservedSectors * 512;
     uint64_t fatSizeBytes = (uint64_t)bootSector.sectorsPerFat * 512;
-    
-    for (int spc : possibleSPCs) {
+
+    for (int spc : possibleSPCs)
+    {
         // Giả lập vùng Data bắt đầu ở đâu với SPC này
         uint64_t dataStart = fatStart + ((uint64_t)bootSector.numFATs * fatSizeBytes);
-        
+
         // Root Cluster (2) nằm ngay đầu vùng Data
         // Đọc thử xem có ra dáng thư mục không
-        if (readBytes(dataStart, buffer, 512) == 512) {
+        if (readBytes(dataStart, buffer, 512) == 512)
+        {
             // Logic check Directory của bạn:
             // Check xem entry đầu có phải là volume label hoặc . hoặc file hợp lệ không
             // (Đơn giản hóa: Check attribute 0x08, 0x10, 0x20...)
             bool looksLikeDir = false;
-            for(int k=0; k<16; k++) {
-                uint8_t attr = buffer[k*32 + 11];
-                if ((attr & 0x18) || attr == 0x20) { // Dir or Vol or Archive
-                     looksLikeDir = true; break; 
+            for (int k = 0; k < 16; k++)
+            {
+                uint8_t attr = buffer[k * 32 + 11];
+                if ((attr & 0x18) || attr == 0x20)
+                { // Dir or Vol or Archive
+                    looksLikeDir = true;
+                    break;
                 }
             }
 
-            if (looksLikeDir) {
+            if (looksLikeDir)
+            {
                 bootSector.sectorsPerCluster = (uint8_t)spc;
                 cout << "      [Guess] Cluster Size " << spc << " matches Root Directory pattern.\n";
                 spcFound = true;
@@ -655,7 +709,8 @@ void FAT32Recovery::reconstructBPB(uint64_t partStartSector, uint32_t partSize)
         }
     }
 
-    if (!spcFound) {
+    if (!spcFound)
+    {
         bootSector.sectorsPerCluster = 8; // Default an toàn
         cout << "      [Warn] Could not guess SPC. Defaulting to 8.\n";
     }
@@ -665,8 +720,6 @@ void FAT32Recovery::reconstructBPB(uint64_t partStartSector, uint32_t partSize)
     memcpy(bootSector.fsType, "FAT32   ", 8);
     saveBootSector(partStartSector * 512);
 }
-
-
 
 // bool FAT32Recovery::reconstructBootSector(int partitionID)
 // {
@@ -840,29 +893,7 @@ void FAT32Recovery::reconstructBPB(uint64_t partStartSector, uint32_t partSize)
 //                       FILE SYSTEM (FAT32)
 // ======================================================================
 
-bool FAT32Recovery::readFAT(int index, vector<uint32_t> &out)
-{
-    out.resize(bootSector.sectorsPerFat * bootSector.bytesPerSector / 4);
-
-    uint64_t offset = fatBegin + (index - 1) * bootSector.sectorsPerFat * bootSector.bytesPerSector;
-
-    vhd.seekg(offset, ios::beg);
-    if (!vhd.read(reinterpret_cast<char *>(out.data()), out.size() * 4))
-        return false;
-
-    return true;
-}
-
-void FAT32Recovery::writeFAT_CopyFrom(const vector<uint32_t> &src)
-{
-    uint64_t offset = fatBegin; // FAT1 luôn nằm đầu tiên
-
-    vhd.seekp(offset, ios::beg);
-    vhd.write(reinterpret_cast<const char *>(src.data()), src.size() * 4);
-    vhd.flush();
-}
-
-void FAT32Recovery::loadFAT(bool autoRepair)
+void FAT32Recovery::loadFAT()
 {
     // Đảm bảo các thông số đã được khởi tạo từ readBootSector/selectPartition
     if (bootSector.sectorsPerFat == 0 || bootSector.bytesPerSector == 0 || fatBegin == 0)
@@ -923,14 +954,11 @@ void FAT32Recovery::loadFAT(bool autoRepair)
                 cout << "[SUCCESS] FAT2 is valid. Using FAT2 data.\n";
                 isFATValid = true;
 
-                // (Optional) Tự động sửa FAT1 bằng FAT2
-                if (autoRepair)
-                {
-                    cout << "[FIX] Overwriting corrupted FAT1 with valid FAT2...\n";
-                    vhd.seekp(fatBegin, ios::beg);
-                    vhd.write((char *)fatBuffer.data(), fatSizeBytes);
-                    vhd.flush();
-                }
+                // Tự động sửa FAT1 bằng FAT2
+                cout << "[FIX] Overwriting corrupted FAT1 with valid FAT2...\n";
+                vhd.seekp(fatBegin, ios::beg);
+                vhd.write((char *)fatBuffer.data(), fatSizeBytes);
+                vhd.flush();
             }
         }
     }
@@ -964,8 +992,8 @@ void FAT32Recovery::loadFAT(bool autoRepair)
 
     // Dọn dẹp: Đảm bảo luồng cout không bị ảnh hưởng bởi hex/dec
     cout << dec;
-    cout << "[SCAN] Checking directory and FAT structures with auto repair = " << autoRepair << "\n";
-    scanAndAutoRepair(bootSector.rootCluster, autoRepair);
+    cout << "[SCAN] Checking directory and FAT structures\n";
+    scanAndAutoRepair(bootSector.rootCluster, true);
     cout << "================================\n";
 }
 
@@ -1066,8 +1094,7 @@ void FAT32Recovery::scanAndAutoRepair(uint32_t dirCluster, bool fix)
     if (hasError && fix)
     {
         cout << ">>> Repairing directory and FAT structures..." << endl;
-        if (!FATRedundancyCheckAndRepair())      // phase 1
-            repairFolderAndClusters(dirCluster); // phase 2
+        repairFolderAndClusters(dirCluster); // phase 2
     }
     else if (hasError)
     {
@@ -1077,105 +1104,6 @@ void FAT32Recovery::scanAndAutoRepair(uint32_t dirCluster, bool fix)
     {
         cout << ">>> No inconsistencies found." << endl;
     }
-}
-
-bool FAT32Recovery::FATRedundancyCheckAndRepair()
-{
-    cout << "[INFO] Damage Prevention and Redundancy Check...\n";
-
-    // 1. Load FAT1 & FAT2
-    vector<uint32_t> fat1, fat2;
-
-    if (!readFAT(1, fat1))
-    {
-        cerr << "[ERROR] Can't read FAT1!\n";
-        return false;
-    }
-
-    if (!readFAT(2, fat2))
-    {
-        cerr << "[ERROR] Cant's read FAT2!\n";
-        return false;
-    }
-
-    if (fat1.size() != fat2.size())
-    {
-        cerr << "[ERROR] FAT1 size not equal to FAT2 size -> Critical!\n";
-        return false;
-    }
-
-    bool fat1Ok = true;
-    bool fat2Ok = true;
-
-    // 2. Kiểm tra tính hợp lệ FAT1
-    for (size_t i = 2; i < fat1.size(); i++)
-    {
-        uint32_t v = fat1[i] & 0x0FFFFFFF;
-        if (v > 0x0FFFFFFF)
-        {
-            fat1Ok = false;
-            break;
-        }
-    }
-
-    // 3. Kiểm tra tính hợp lệ FAT2
-    for (size_t i = 2; i < fat2.size(); i++)
-    {
-        uint32_t v = fat2[i] & 0x0FFFFFFF;
-        if (v > 0x0FFFFFFF)
-        {
-            fat2Ok = false;
-            break;
-        }
-    }
-
-    // 4. Phân nhánh theo kết quả
-
-    // ----------------------------------------------------------
-    // FAT1 OK + FAT2 OK → chọn FAT1
-    // ----------------------------------------------------------
-    if (fat1Ok && fat2Ok)
-    {
-        cout << "[OK] FAT1 and FAT2 valid.\n";
-        FAT = fat1;
-        return true;
-    }
-
-    // ----------------------------------------------------------
-    // FAT1 hỏng nhưng FAT2 tốt → khôi phục
-    // ----------------------------------------------------------
-    if (!fat1Ok && fat2Ok)
-    {
-        cout << "[WARNING] FAT1 is broken - restoring from FAT2...\n";
-
-        // Sửa trong RAM
-        FAT = fat2;
-
-        // Sửa trên đĩa (ghi FAT2 đè FAT1)
-        writeFAT_CopyFrom(fat2);
-
-        cout << "[SUCCESS] FAT1 restored successfully.\n";
-        return true;
-    }
-
-    // ----------------------------------------------------------
-    // FAT1 tốt nhưng FAT2 hỏng → vẫn dùng FAT1
-    // ----------------------------------------------------------
-    if (fat1Ok && !fat2Ok)
-    {
-        cout << "[WARNING] FAT2 is broken – still using FAT1.\n";
-        FAT = fat1;
-        return true;
-    }
-
-    // ----------------------------------------------------------
-    // Cả 2 FAT đều hỏng → buộc chuyển sang Phase 2 (deep scan)
-    // ----------------------------------------------------------
-    cerr << "[ERROR] both FAT1 and FAT2 are broken!.\n";
-
-    // Dùng tạm FAT1 (dù corrupt) để directory scanning không crash
-    FAT = fat1;
-    return false;
 }
 
 // Sửa chữa các mục nhập thư mục (directory entries) và chuỗi FAT (FAT chains) bên dưới một cluster thư mục

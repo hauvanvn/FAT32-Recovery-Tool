@@ -49,7 +49,7 @@ int main()
         cin >> partIndex;
         cout << "\n>>> Selecting Partition " << partIndex << "...\n";
 
-        tool.readBootSector(partIndex);
+        tool.initializeVolume(partIndex);
         // Giả sử mặc định việc sửa bảng FAT và RDET là true
         // Trong thực tế bạn có thể cho người dùng nhập cin >> autoRepair
         tool.loadFAT(); // Tải bảng FAT vào RAM
