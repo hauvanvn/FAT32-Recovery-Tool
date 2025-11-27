@@ -148,7 +148,10 @@ private:
 
     ssize_t readBytes(uint64_t offset, void *buf, size_t size) const;
     void saveMBRToDisk();
-    
+
+    void parseBPB(const uint8_t *buffer);
+    void saveBootSector(uint64_t offset);
+
     void writeAll(std::ostream &out, const void *buf, size_t size) const;
     static string formatShortName(const uint8_t name[11]);
 
@@ -167,12 +170,14 @@ public:
     bool rebuildMBR();
     void listPartitions() const;
 
-    void readBootSector(int partitionID);
-    bool fixBootSectorBackup(uint64_t partitionStartOffset, uint16_t backupSectorLocation = 6);
-    bool reconstructBootSector(int partitionID);
-    void loadFAT(bool autoRepair);
+    bool initializeVolume(int partitionIndex);
+    bool checkAndFixBootSector(uint64_t partStartSector);
+    void reconstructBPB(uint64_t partStartSector, uint32_t partSize);
+    void printVolumeInfo() const;
+
 
     // Core FAT operations
+    void loadFAT(bool autoRepair);
     bool readFAT(int index, vector<uint32_t> &out);
     void writeFAT_CopyFrom(const vector<uint32_t> &src);
     void writeFAT();
